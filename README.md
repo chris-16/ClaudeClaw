@@ -387,25 +387,37 @@ Every skill in `~/.claude/skills/` loads on every session. Call them directly (`
 
 ## Bot commands
 
+**Everyday commands:**
+
 | Command | What it does |
 |---------|-------------|
-| `/start` | Confirm the bot is online |
 | `/help` | List all available commands |
-| `/chatid` | Get your Telegram chat ID |
-| `/newchat` | Start a fresh Claude Code session |
-| `/respin` | After `/newchat`, pull the last 20 conversation turns back as context |
-| `/voice` | Toggle voice response mode on/off |
-| `/model` | Switch Claude model — `/model haiku`, `/model sonnet`, `/model opus` (default). Resets on restart |
-| `/stop` | Cancel the current agent query mid-execution |
-| `/memory` | Show recent memories for this chat |
-| `/forget` | Clear current session |
-| `/wa` | Open the WhatsApp interface |
-| `/slack` | Open the Slack interface |
-| `/dashboard` | Get a link to the live web dashboard |
+| `/stop` | Cancel the current agent query mid-execution — works from Telegram and the dashboard |
+| `/model` | Switch Claude model for this chat. `/model haiku` for speed, `/model sonnet` for balance, `/model opus` (default) for full power. Resets on restart |
+| `/voice` | Toggle voice replies on/off for all messages. When off, voice notes still get transcribed and executed — replies just come back as text |
+| `/newchat` | Wipe the Claude Code session and start fresh. Use when context gets stale or the conversation window is filling up |
+| `/respin` | Pull the last 20 conversation turns back into a fresh session. Run this right after `/newchat` to keep recent context without the full token weight |
+| `/memory` | Show what the bot remembers about you (recent memories from SQLite) |
+| `/forget` | Clear the session ID only. Memories stay and decay naturally over time |
 
-All commands are registered in Telegram's command menu, so you'll see autocomplete suggestions when you type `/`.
+**Integrations:**
 
-Any other `/command` passes through to Claude and routes to the matching skill.
+| Command | What it does |
+|---------|-------------|
+| `/wa` | Open the WhatsApp interface — shows recent chats, pick one to read and reply |
+| `/slack` | Open the Slack interface — same flow as WhatsApp |
+| `/dashboard` | Get a clickable link to the live web dashboard |
+
+**Setup (one-time):**
+
+| Command | What it does |
+|---------|-------------|
+| `/start` | First message to the bot — confirms it's running |
+| `/chatid` | Shows your Telegram chat ID for the `ALLOWED_CHAT_ID` setting in `.env` |
+
+All commands are registered in Telegram's command menu, so you get autocomplete when you type `/`.
+
+Any other `/command` (like `/todo`, `/gmail`, `/calendar`) passes through to Claude and routes to whatever matching skill you have installed.
 
 ### /newchat + /respin workflow
 
