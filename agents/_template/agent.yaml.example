@@ -1,0 +1,29 @@
+# Agent configuration
+# Copy this folder, rename it, and fill in your values.
+#
+# Then add your bot token to .env:
+#   MYAGENT_BOT_TOKEN=1234567890:AAFxxxxxxx
+#
+# Start with:
+#   npm start -- --agent myagent
+
+name: My Agent
+description: What this agent does
+
+# The env var name in .env that holds this agent's Telegram bot token.
+# Create a bot via @BotFather in Telegram, paste the token into .env.
+telegram_bot_token_env: MYAGENT_BOT_TOKEN
+
+# Default model. Options: claude-opus-4-6, claude-sonnet-4-6, claude-haiku-4-5
+# Users can override per-chat with /model in Telegram.
+model: claude-sonnet-4-6
+
+# Obsidian integration (optional).
+# Assign folders from your vault so this agent auto-loads relevant context.
+# obsidian:
+#   vault: /path/to/your/obsidian/vault
+#   folders:
+#     - FolderA/
+#     - FolderB/
+#   read_only:
+#     - Daily Notes/
