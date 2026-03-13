@@ -797,7 +797,7 @@ export function updateTaskAfterRun(
   const now = Math.floor(Date.now() / 1000);
   db.prepare(
     `UPDATE scheduled_tasks SET status = 'active', last_run = ?, next_run = ?, last_result = ?, last_status = ?, started_at = NULL WHERE id = ?`,
-  ).run(now, nextRun, result.slice(0, 500), lastStatus, id);
+  ).run(now, nextRun, result.slice(0, 4000), lastStatus, id);
 }
 
 export function resetStuckTasks(agentId: string): number {
@@ -817,6 +817,27 @@ export function pauseScheduledTask(id: string): void {
 
 export function resumeScheduledTask(id: string): void {
   db.prepare(`UPDATE scheduled_tasks SET status = 'active' WHERE id = ?`).run(id);
+}
+
+/**
+ * Get recent scheduled task outputs for a given agent.
+ * Used to inject context into the next user message so Claude knows
+ * what was just shown to the user via a scheduled task.
+ *
+ * Returns tasks that ran in the last `withinMinutes` (default 30).
+ */
+export function getRecentTaskOutputs(
+  agentId: string,
+  withinMinutes = 30,
+): Array<{ prompt: string; last_result: string; last_run: number }> {
+  const cutoff = Math.floor(Date.now() / 1000) - withinMinutes * 60;
+  return db
+    .prepare(
+      `SELECT prompt, last_result, last_run FROM scheduled_tasks
+       WHERE agent_id = ? AND last_status = 'success' AND last_run > ?
+       ORDER BY last_run DESC LIMIT 3`,
+    )
+    .all(agentId, cutoff) as Array<{ prompt: string; last_result: string; last_run: number }>;
 }
 
 // ── WhatsApp message map ──────────────────────────────────────────────

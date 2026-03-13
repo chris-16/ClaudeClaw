@@ -18,7 +18,7 @@ import {
   TYPING_REFRESH_MS,
   AGENT_TIMEOUT_MS,
 } from './config.js';
-import { clearSession, getRecentConversation, getRecentMemories, getSession, getSessionConversation, logToHiveMind, setSession, lookupWaChatId, saveWaMessageMap, saveTokenUsage } from './db.js';
+import { clearSession, getRecentConversation, getRecentMemories, getRecentTaskOutputs, getSession, getSessionConversation, logToHiveMind, setSession, lookupWaChatId, saveWaMessageMap, saveTokenUsage } from './db.js';
 import { logger } from './logger.js';
 import { downloadMedia, buildPhotoMessage, buildDocumentMessage, buildVideoMessage } from './media.js';
 import { buildMemoryContext, saveConversationTurn } from './memory.js';
@@ -362,6 +362,18 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
   const parts: string[] = [];
   if (agentSystemPrompt) parts.push(`[Agent role — follow these instructions]\n${agentSystemPrompt}\n[End agent role]`);
   if (memCtx) parts.push(memCtx);
+
+  // Inject recent scheduled task outputs so the user can reply to them naturally.
+  // Without this, Claude has no idea what a scheduled task just showed the user.
+  const recentTasks = getRecentTaskOutputs(AGENT_ID, 30);
+  if (recentTasks.length > 0) {
+    const taskLines = recentTasks.map((t) => {
+      const ago = Math.round((Date.now() / 1000 - t.last_run) / 60);
+      return `[Scheduled task ran ${ago}m ago]\nTask: ${t.prompt}\nOutput:\n${t.last_result}`;
+    });
+    parts.push(`[Recent scheduled task context — the user may be replying to this]\n${taskLines.join('\n\n')}\n[End task context]`);
+  }
+
   parts.push(message);
   const fullMessage = parts.join('\n\n');
 
@@ -1266,6 +1278,16 @@ async function processDashboardMessage(
     const dashParts: string[] = [];
     if (agentSystemPrompt) dashParts.push(`[Agent role — follow these instructions]\n${agentSystemPrompt}\n[End agent role]`);
     if (memCtx) dashParts.push(memCtx);
+
+    const recentDashTasks = getRecentTaskOutputs(AGENT_ID, 30);
+    if (recentDashTasks.length > 0) {
+      const taskLines = recentDashTasks.map((t) => {
+        const ago = Math.round((Date.now() / 1000 - t.last_run) / 60);
+        return `[Scheduled task ran ${ago}m ago]\nTask: ${t.prompt}\nOutput:\n${t.last_result}`;
+      });
+      dashParts.push(`[Recent scheduled task context — the user may be replying to this]\n${taskLines.join('\n\n')}\n[End task context]`);
+    }
+
     dashParts.push(text);
     const fullMessage = dashParts.join('\n\n');
     const sessionId = getSession(chatIdStr, AGENT_ID);
