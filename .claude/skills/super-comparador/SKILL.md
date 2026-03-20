@@ -18,10 +18,11 @@ Compara precios de una lista de compras en los tres grandes supermercados online
 de Chile y recomienda la combinación óptima (1, 2 o 3 pedidos) que minimiza el
 **costo total incluyendo despacho**.
 
-**Herramienta de browser**: Playwright MCP (headless). Herramientas disponibles:
+**Herramienta de browser**: Playwright MCP con Chrome real (headed, no headless). Herramientas disponibles:
 `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`,
 `browser_scroll`, `browser_take_screenshot`.
 NO usar WebFetch — los sitios cargan productos via JavaScript.
+⚠️ Lider y Tottus bloquean Chromium headless (CAPTCHA / Cloudflare). Chrome real headed los evita.
 
 ---
 
@@ -228,7 +229,8 @@ Si la opción ganadora divide en múltiples pedidos, mostrar claramente:
 
 ### Sobre los sitios
 - Los 3 sitios cargan productos via JavaScript/SPA — WebFetch solo obtiene el shell HTML sin datos. **Obligatorio usar Playwright MCP**.
-- Jumbo puede requerir login para ver precios de despacho. En modo headless no hay sesión guardada — los precios de producto igualmente son visibles sin login.
+- **Lider y Tottus bloquean Chromium headless** (CAPTCHA anti-bot / Cloudflare). Playwright MCP está configurado con Chrome real (headed) para evitarlo — verificado 2026-03-20.
+- Jumbo funciona correctamente. Precios de producto visibles sin login. Asumir $0 despacho por Jumbo Prime.
 - Lider NO requiere login para ver precios. Los productos se muestran debajo de un hero banner grande — siempre hacer scroll down tras navegar a resultados.
 - Tottus NO requiere login. La URL antigua `/tottus/search` está rota (SSL 526). La URL correcta es `/tottus-cl/buscar`.
 - Los 3 sitios muestran un cookie banner. Cerrar con `browser_click` en la X cuando sea posible.
