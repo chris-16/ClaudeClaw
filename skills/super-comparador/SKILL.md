@@ -28,7 +28,7 @@ de Chile y recomienda la combinación óptima (1, 2 o 3 pedidos) que minimiza el
 | Supermercado | Costo de despacho | Mínimo |
 |---|---|---|
 | **Jumbo.cl** | $0 siempre (Jumbo Prime activo) | Sin mínimo |
-| **Lider.cl** | $0 si total ≥ $30.000, sino **$3.990** | $30.000 |
+| **Lider.cl** | $0 si total ≥ $49.990, sino **$3.990** | $49.990 |
 | **Tottus.cl** | $0 si total ≥ $49.990, sino **$3.490** | $49.990 |
 
 > Si Lider o Tottus no alcanzan el mínimo: sumar el costo de despacho al total
@@ -202,7 +202,7 @@ Si la opción ganadora divide en múltiples pedidos, mostrar claramente:
 ## Tips de navegación (verificados 2026-03-20)
 
 - **Jumbo**: URL `https://www.jumbo.cl/busqueda?ft=leche+entera` — capturar precio por unidad de medida que aparece bajo el precio principal (ej: "$1.990 x kg"). Los filtros de marca están en la sidebar izquierda. Jumbo muestra precios en oferta con precio tachado al lado.
-- **Lider**: URL `https://super.lider.cl/search?q=leche+entera` — Los resultados cargan DEBAJO del hero/banner. Hacer scroll down después de navegar. Precios con "Rebaja" se muestran con precio tachado y ahorro. Verificar si hay precio "Club Lider" vs precio normal. Despacho gratis sobre $30.000 (observado en sitio).
+- **Lider**: URL `https://super.lider.cl/search?q=leche+entera` — Los resultados cargan DEBAJO del hero/banner. Hacer scroll down después de navegar. Precios con "Rebaja" se muestran con precio tachado y ahorro. Verificar si hay precio "Club Lider" vs precio normal. Despacho gratis sobre $49.990.
 - **Tottus**: URL `https://www.tottus.cl/tottus-cl/buscar?Ntt=leche+entera` — La URL antigua `/tottus/search` da error SSL 526. SIEMPRE usar `/tottus-cl/buscar`. Muestra precio/kg y promos (ej: "2x$3.000"). Verificar precio con/sin tarjeta CMR. Si la búsqueda directa falla, navegar a `https://www.tottus.cl/tottus-cl` y usar el buscador del sitio. Despacho gratis con compra mínima $49.990.
 - Si hay precios con tarjeta de fidelidad (Club Lider, CMR Tottus): **usar SIEMPRE el precio sin tarjeta** — Chris no tiene estas tarjetas y la comparación debe ser neutral
 - Rechazar cookies/pop-ups sin aceptar tracking
@@ -226,6 +226,6 @@ Si la opción ganadora divide en múltiples pedidos, mostrar claramente:
 
 ### Sobre despacho (factor decisivo)
 - **Para compras chicas (<$30k):** Jumbo Prime gana siempre por despacho gratis sin mínimo.
-- **Para compras medianas ($30k-$50k):** Lider empata (despacho gratis sobre $30k). Comparar subtotales.
+- **Para compras medianas ($30k-$50k):** Lider y Tottus tienen despacho gratis sobre $49.990. Comparar subtotales.
 - **Para compras grandes (>$50k):** Los 3 tienen despacho gratis. La comparación depende solo de precios unitarios.
 - La combinación óptima (split entre supers) rara vez conviene en compras chicas porque cada super adicional suma su despacho.
