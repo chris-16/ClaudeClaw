@@ -14,6 +14,7 @@ import {
   MAX_MESSAGE_LENGTH,
   activeBotToken,
   agentDefaultModel,
+  agentMcpAllowlist,
   agentSystemPrompt,
   TYPING_REFRESH_MS,
   AGENT_TIMEOUT_MS,
@@ -419,6 +420,7 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
       onProgress,
       chatModelOverride.get(chatIdStr) ?? agentDefaultModel,
       abortCtrl,
+      agentMcpAllowlist,
     );
 
     clearTimeout(timeoutId);
@@ -1310,6 +1312,7 @@ async function processDashboardMessage(
       onProgress,
       agentDefaultModel,
       abortCtrl,
+      agentMcpAllowlist,
     );
 
     clearTimeout(dashTimeout);

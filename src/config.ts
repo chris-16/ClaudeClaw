@@ -16,6 +16,11 @@ const envConfig = readEnvFile([
   'DASHBOARD_PORT',
   'DASHBOARD_TOKEN',
   'DASHBOARD_URL',
+  'DASHBOARD_SESSION_TTL_HOURS',
+  'DASHBOARD_DAILY_BUDGET_USD',
+  'DASHBOARD_MONTHLY_BUDGET_USD',
+  'DASHBOARD_ALLOWED_IPS',
+  'DASHBOARD_OTP_ENABLED',
   'CLAUDECLAW_CONFIG',
   'DB_ENCRYPTION_KEY',
   'GOOGLE_API_KEY',
@@ -30,6 +35,7 @@ export let agentCwd: string | undefined; // undefined = use PROJECT_ROOT
 export let agentDefaultModel: string | undefined; // from agent.yaml
 export let agentObsidianConfig: { vault: string; folders: string[]; readOnly?: string[] } | undefined;
 export let agentSystemPrompt: string | undefined; // loaded from agents/{id}/CLAUDE.md
+export let agentMcpAllowlist: string[] | undefined; // from agent.yaml mcp_servers
 
 export function setAgentOverrides(opts: {
   agentId: string;
@@ -38,6 +44,7 @@ export function setAgentOverrides(opts: {
   model?: string;
   obsidian?: { vault: string; folders: string[]; readOnly?: string[] };
   systemPrompt?: string;
+  mcpServers?: string[];
 }): void {
   AGENT_ID = opts.agentId;
   activeBotToken = opts.botToken;
@@ -45,6 +52,7 @@ export function setAgentOverrides(opts: {
   agentDefaultModel = opts.model;
   agentObsidianConfig = opts.obsidian;
   agentSystemPrompt = opts.systemPrompt;
+  agentMcpAllowlist = opts.mcpServers;
 }
 
 export const TELEGRAM_BOT_TOKEN =
@@ -127,8 +135,25 @@ export const DASHBOARD_TOKEN =
   process.env.DASHBOARD_TOKEN || envConfig.DASHBOARD_TOKEN || '';
 export const DASHBOARD_URL =
   process.env.DASHBOARD_URL || envConfig.DASHBOARD_URL || '';
+export const DASHBOARD_SESSION_TTL_HOURS = parseInt(
+  process.env.DASHBOARD_SESSION_TTL_HOURS || envConfig.DASHBOARD_SESSION_TTL_HOURS || '24',
+  10,
+);
+export const DASHBOARD_DAILY_BUDGET_USD = parseFloat(
+  process.env.DASHBOARD_DAILY_BUDGET_USD || envConfig.DASHBOARD_DAILY_BUDGET_USD || '0',
+);
+export const DASHBOARD_MONTHLY_BUDGET_USD = parseFloat(
+  process.env.DASHBOARD_MONTHLY_BUDGET_USD || envConfig.DASHBOARD_MONTHLY_BUDGET_USD || '0',
+);
+// Comma-separated IP addresses/prefixes allowed to access the dashboard.
+// Example: "127.0.0.1,192.168.1.0" — leave empty to allow all IPs.
+export const DASHBOARD_ALLOWED_IPS =
+  process.env.DASHBOARD_ALLOWED_IPS || envConfig.DASHBOARD_ALLOWED_IPS || '';
+// When true, remote logins require a one-time code sent via Telegram (2FA).
+export const DASHBOARD_OTP_ENABLED =
+  (process.env.DASHBOARD_OTP_ENABLED || envConfig.DASHBOARD_OTP_ENABLED || '').toLowerCase() === 'true';
 
-// Database encryption key (SQLCipher). Required for encrypted database access.
+// Database encryption key
 export const DB_ENCRYPTION_KEY =
   process.env.DB_ENCRYPTION_KEY || envConfig.DB_ENCRYPTION_KEY || '';
 

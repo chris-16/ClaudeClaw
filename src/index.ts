@@ -39,6 +39,7 @@ if (AGENT_ID !== 'main') {
     model: agentConfig.model,
     obsidian: agentConfig.obsidian,
     systemPrompt,
+    mcpServers: agentConfig.mcpServers,
   });
   logger.info({ agentId: AGENT_ID, name: agentConfig.name }, 'Running as agent');
 } else {
@@ -98,7 +99,12 @@ function acquireLock(): void {
 }
 
 function releaseLock(): void {
-  try { fs.unlinkSync(PID_FILE); } catch { /* ignore */ }
+  try {
+    const current = fs.readFileSync(PID_FILE, 'utf8').trim();
+    if (parseInt(current, 10) === process.pid) {
+      fs.unlinkSync(PID_FILE);
+    }
+  } catch { /* ignore */ }
 }
 
 async function main(): Promise<void> {
@@ -174,22 +180,31 @@ async function main(): Promise<void> {
 
   logger.info({ agentId: AGENT_ID }, 'Starting ClaudeClaw...');
 
-  await bot.start({
-    onStart: (botInfo) => {
-      setTelegramConnected(true);
-      setBotInfo(botInfo.username ?? '', botInfo.first_name ?? 'ClaudeClaw');
-      logger.info({ username: botInfo.username }, 'ClaudeClaw is running');
-      if (AGENT_ID === 'main') {
-        console.log(`\n  ClaudeClaw online: @${botInfo.username}`);
-        if (!ALLOWED_CHAT_ID) {
-          console.log(`  Send /chatid to get your chat ID for ALLOWED_CHAT_ID`);
+  try {
+    await bot.start({
+      onStart: (botInfo) => {
+        setTelegramConnected(true);
+        setBotInfo(botInfo.username ?? '', botInfo.first_name ?? 'ClaudeClaw');
+        logger.info({ username: botInfo.username }, 'ClaudeClaw is running');
+
+        if (AGENT_ID === 'main') {
+          console.log(`\n  ClaudeClaw online: @${botInfo.username}`);
+          if (!ALLOWED_CHAT_ID) {
+            console.log(`  Send /chatid to get your chat ID for ALLOWED_CHAT_ID`);
+          }
+          console.log();
+        } else {
+          console.log(`\n  ClaudeClaw agent [${AGENT_ID}] online: @${botInfo.username}\n`);
         }
-        console.log();
-      } else {
-        console.log(`\n  ClaudeClaw agent [${AGENT_ID}] online: @${botInfo.username}\n`);
-      }
-    },
-  });
+      },
+    });
+  } catch (err: any) {
+    if (err.description?.includes('Conflict: terminated by other getUpdates request')) {
+      logger.warn('Bot instance terminated by another session (Conflict 409). Shutting down...');
+      process.exit(0);
+    }
+    throw err;
+  }
 }
 
 main().catch((err: unknown) => {
