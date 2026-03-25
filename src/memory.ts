@@ -1,17 +1,21 @@
-import { agentObsidianConfig, GOOGLE_API_KEY } from './config.js';
+import { agentObsidianConfig, GEMINI_MEMORY_ENABLED, GOOGLE_API_KEY, WORKING_MEMORY_MAX_CHARS } from './config.js';
 import {
   decayMemories,
   getRecentConsolidations,
   getRecentHighImportanceMemories,
+  getWorkingMemory,
   logConversationTurn,
   pruneConversationLog,
   pruneSlackMessages,
   pruneWaMessages,
   searchConsolidations,
   searchMemories,
+  setWorkingMemory,
   touchMemory,
 } from './db.js';
 import { embedText } from './embeddings.js';
+import { generateContent } from './gemini.js';
+import { decayEntities } from './knowledge-graph.js';
 import { logger } from './logger.js';
 import { ingestConversationTurn } from './memory-ingest.js';
 import { buildObsidianContext } from './obsidian.js';
@@ -35,7 +39,7 @@ export async function buildMemoryContext(
 
   // Embed the query for vector search (async, adds ~200ms but gives semantic results)
   let queryEmbedding: number[] | undefined;
-  if (GOOGLE_API_KEY) {
+  if (GEMINI_MEMORY_ENABLED && GOOGLE_API_KEY) {
     try {
       queryEmbedding = await embedText(userMessage);
     } catch {
@@ -100,10 +104,64 @@ export async function buildMemoryContext(
     parts.push(blocks.join('\n'));
   }
 
+  // Hint: the MCP memory server provides deeper knowledge graph access
+  parts.push('[Memory tools available: use search_memory and open_nodes MCP tools to recall detailed information from your knowledge graph]');
+
+  // Hint: knowledge base tools for technical documentation
+  parts.push('[Knowledge Base available: use kb_search tool to look up technical documentation from crawled sources]');
+
   const obsidianBlock = buildObsidianContext(agentObsidianConfig);
   if (obsidianBlock) parts.push(obsidianBlock);
 
   return parts.join('\n\n');
+}
+
+/**
+ * Return the current working memory for injection into the prompt.
+ * Returns empty string if no working memory exists.
+ */
+export function getWorkingMemoryContext(chatId: string, agentId = 'main'): string {
+  const summary = getWorkingMemory(chatId, agentId);
+  if (!summary) return '';
+  return `[Working memory — recent context]\n${summary}\n[End working memory]`;
+}
+
+/**
+ * Update working memory with a summary of the latest turn.
+ * Uses Gemini (cheap) to merge the previous summary with the new turn.
+ * Fire-and-forget: never blocks the response.
+ */
+async function updateWorkingMemory(
+  chatId: string,
+  userMessage: string,
+  claudeResponse: string,
+  agentId = 'main',
+): Promise<void> {
+  if (!GOOGLE_API_KEY) return;
+
+  const prev = getWorkingMemory(chatId, agentId);
+  const prompt = `You maintain a working memory summary for an AI assistant conversation.
+
+PREVIOUS SUMMARY:
+${prev || '(empty — first turn)'}
+
+LATEST TURN:
+User: ${userMessage.slice(0, 500)}
+Assistant: ${claudeResponse.slice(0, 1000)}
+
+Write an updated summary that captures the KEY context needed for the next turn.
+Include: what was discussed, decisions made, pending items, important facts.
+Drop: greetings, pleasantries, resolved items, redundant details.
+Max ${Math.floor(WORKING_MEMORY_MAX_CHARS / 4)} words. Use bullet points. Be terse.`;
+
+  try {
+    const result = await generateContent(prompt);
+    const summary = result.slice(0, WORKING_MEMORY_MAX_CHARS);
+    setWorkingMemory(chatId, summary, agentId);
+    logger.info({ chatId, agentId, summaryLen: summary.length }, 'Working memory updated');
+  } catch (err) {
+    logger.warn({ err }, 'Working memory update failed (non-fatal)');
+  }
 }
 
 /**
@@ -129,10 +187,17 @@ export function saveConversationTurn(
   }
 
   // Fire-and-forget: LLM-powered memory extraction via Gemini
-  // This runs async and never blocks the user's response
-  void ingestConversationTurn(chatId, userMessage, claudeResponse).catch((err) => {
-    logger.error({ err }, 'Memory ingestion fire-and-forget failed');
-  });
+  // Only runs when GEMINI_MEMORY_ENABLED=true (disabled by default to save costs)
+  if (GEMINI_MEMORY_ENABLED) {
+    void ingestConversationTurn(chatId, userMessage, claudeResponse).catch((err) => {
+      logger.error({ err }, 'Memory ingestion fire-and-forget failed');
+    });
+
+    // Fire-and-forget: update working memory summary via Gemini
+    void updateWorkingMemory(chatId, userMessage, claudeResponse, agentId).catch((err) => {
+      logger.warn({ err }, 'Working memory update fire-and-forget failed');
+    });
+  }
 }
 
 /**
@@ -146,6 +211,15 @@ export function saveConversationTurn(
  */
 export function runDecaySweep(): void {
   decayMemories();
+  // Also decay knowledge graph entities
+  try {
+    const kgResult = decayEntities();
+    if (kgResult.deleted > 0) {
+      logger.info({ kgDecayed: kgResult.decayed, kgDeleted: kgResult.deleted }, 'KG entity decay complete');
+    }
+  } catch (err) {
+    logger.warn({ err }, 'KG entity decay failed (non-fatal)');
+  }
   pruneConversationLog(500);
 
   // Enforce 3-day retention on messaging data

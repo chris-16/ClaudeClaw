@@ -24,6 +24,19 @@ const envConfig = readEnvFile([
   'CLAUDECLAW_CONFIG',
   'DB_ENCRYPTION_KEY',
   'GOOGLE_API_KEY',
+  'SAFE_MODE',
+  'SAFE_MAX_QUERIES_PER_HOUR',
+  'SAFE_MAX_COST_PER_DAY_USD',
+  'SAFE_AGENT_TIMEOUT_MS',
+  'SAFE_DISABLE_SCHEDULED_TASKS',
+  'SAFE_DISABLE_DELEGATION',
+  'AGENT_TIMEOUT_MS',
+  'FORCE_FRESH_SESSION',
+  'WORKING_MEMORY_MAX_CHARS',
+  'ALERT_QUERY_COST_USD',
+  'ALERT_DAILY_COST_USD',
+  'ALERT_CACHE_READ_TOKENS',
+  'GEMINI_MEMORY_ENABLED',
 ]);
 
 // ── Multi-agent support ──────────────────────────────────────────────
@@ -157,6 +170,66 @@ export const DASHBOARD_OTP_ENABLED =
 export const DB_ENCRYPTION_KEY =
   process.env.DB_ENCRYPTION_KEY || envConfig.DB_ENCRYPTION_KEY || '';
 
-// Google API key for Gemini (memory extraction + consolidation)
+// Google API key for Gemini (video analysis, and optionally memory features)
 export const GOOGLE_API_KEY =
   process.env.GOOGLE_API_KEY || envConfig.GOOGLE_API_KEY || '';
+
+// Enable Gemini-powered memory features (ingest, consolidation, embeddings).
+// When false (default), GOOGLE_API_KEY is still available for video analysis
+// but background memory calls to Gemini are disabled to save costs.
+export const GEMINI_MEMORY_ENABLED =
+  (process.env.GEMINI_MEMORY_ENABLED || envConfig.GEMINI_MEMORY_ENABLED || '').toLowerCase() === 'true';
+
+// ── Safe Mode: cost containment ──────────────────────────────────────
+// Set SAFE_MODE=true in .env to enable hard limits on Claude API usage.
+// All limits are configurable via .env and only enforced when SAFE_MODE is on.
+export const SAFE_MODE =
+  (process.env.SAFE_MODE || envConfig.SAFE_MODE || '').toLowerCase() === 'true';
+
+// Max queries (runAgent calls) per agent per hour. Resets on the hour.
+export const SAFE_MAX_QUERIES_PER_HOUR = parseInt(
+  process.env.SAFE_MAX_QUERIES_PER_HOUR || envConfig.SAFE_MAX_QUERIES_PER_HOUR || '20', 10,
+);
+
+// Max total cost (USD) per agent per day. Checked via token_usage table.
+export const SAFE_MAX_COST_PER_DAY_USD = parseFloat(
+  process.env.SAFE_MAX_COST_PER_DAY_USD || envConfig.SAFE_MAX_COST_PER_DAY_USD || '5.00',
+);
+
+// Timeout for agent queries in safe mode (ms). Overrides AGENT_TIMEOUT_MS.
+export const SAFE_AGENT_TIMEOUT_MS = parseInt(
+  process.env.SAFE_AGENT_TIMEOUT_MS || envConfig.SAFE_AGENT_TIMEOUT_MS || '45000', 10,
+);
+
+// Disable scheduled tasks in safe mode (they run unattended and burn credits)
+export const SAFE_DISABLE_SCHEDULED_TASKS =
+  (process.env.SAFE_DISABLE_SCHEDULED_TASKS || envConfig.SAFE_DISABLE_SCHEDULED_TASKS || 'true').toLowerCase() === 'true';
+
+// Disable agent delegation in safe mode (prevents cascading multi-agent costs)
+export const SAFE_DISABLE_DELEGATION =
+  (process.env.SAFE_DISABLE_DELEGATION || envConfig.SAFE_DISABLE_DELEGATION || 'true').toLowerCase() === 'true';
+
+// ── Session control ──────────────────────────────────────────────────
+// Force fresh sessions: never resume a previous session. Eliminates cache_read
+// costs (~80% of per-query spend). Working memory provides context continuity.
+export const FORCE_FRESH_SESSION =
+  (process.env.FORCE_FRESH_SESSION || envConfig.FORCE_FRESH_SESSION || '').toLowerCase() === 'true';
+
+// ── Working Memory ───────────────────────────────────────────────────
+// Max chars for working memory summary injected into each fresh query.
+// Keeps context continuity without resuming expensive sessions.
+export const WORKING_MEMORY_MAX_CHARS = parseInt(
+  process.env.WORKING_MEMORY_MAX_CHARS || envConfig.WORKING_MEMORY_MAX_CHARS || '2000', 10,
+);
+
+// ── Cost Alerts ──────────────────────────────────────────────────────
+// Telegram alerts when cost thresholds are exceeded. Set to 0 to disable.
+export const ALERT_QUERY_COST_USD = parseFloat(
+  process.env.ALERT_QUERY_COST_USD || envConfig.ALERT_QUERY_COST_USD || '1.00',
+);
+export const ALERT_DAILY_COST_USD = parseFloat(
+  process.env.ALERT_DAILY_COST_USD || envConfig.ALERT_DAILY_COST_USD || '5.00',
+);
+export const ALERT_CACHE_READ_TOKENS = parseInt(
+  process.env.ALERT_CACHE_READ_TOKENS || envConfig.ALERT_CACHE_READ_TOKENS || '50000', 10,
+);

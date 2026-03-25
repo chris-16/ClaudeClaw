@@ -4,7 +4,7 @@ import path from 'path';
 import { loadAgentConfig, resolveAgentDir, resolveAgentClaudeMd } from './agent-config.js';
 import { createBot } from './bot.js';
 import { checkPendingMigrations } from './migrations.js';
-import { ALLOWED_CHAT_ID, activeBotToken, STORE_DIR, PROJECT_ROOT, CLAUDECLAW_CONFIG, GOOGLE_API_KEY, setAgentOverrides } from './config.js';
+import { ALLOWED_CHAT_ID, activeBotToken, STORE_DIR, PROJECT_ROOT, CLAUDECLAW_CONFIG, GEMINI_MEMORY_ENABLED, GOOGLE_API_KEY, setAgentOverrides, SAFE_MODE, SAFE_MAX_QUERIES_PER_HOUR, SAFE_MAX_COST_PER_DAY_USD, SAFE_AGENT_TIMEOUT_MS, SAFE_DISABLE_SCHEDULED_TASKS, SAFE_DISABLE_DELEGATION } from './config.js';
 import { startDashboard } from './dashboard.js';
 import { initDatabase } from './db.js';
 import { logger } from './logger.js';
@@ -21,6 +21,16 @@ const AGENT_ID = agentFlagIndex !== -1 ? process.argv[agentFlagIndex + 1] : 'mai
 
 // Export AGENT_ID to env so child processes (schedule-cli, etc.) inherit it
 process.env.CLAUDECLAW_AGENT_ID = AGENT_ID;
+
+// ── Safe Mode startup log ──
+if (SAFE_MODE) {
+  console.log('\n  ⚠️  SAFE MODE ENABLED — cost containment active');
+  console.log(`  Max queries/hour: ${SAFE_MAX_QUERIES_PER_HOUR}`);
+  console.log(`  Max cost/day: $${SAFE_MAX_COST_PER_DAY_USD}`);
+  console.log(`  Agent timeout: ${SAFE_AGENT_TIMEOUT_MS / 1000}s`);
+  console.log(`  Scheduled tasks: ${SAFE_DISABLE_SCHEDULED_TASKS ? 'DISABLED' : 'enabled'}`);
+  console.log(`  Agent delegation: ${SAFE_DISABLE_DELEGATION ? 'DISABLED' : 'enabled'}\n`);
+}
 
 if (AGENT_ID !== 'main') {
   const agentConfig = loadAgentConfig(AGENT_ID);
@@ -41,7 +51,7 @@ if (AGENT_ID !== 'main') {
     systemPrompt,
     mcpServers: agentConfig.mcpServers,
   });
-  logger.info({ agentId: AGENT_ID, name: agentConfig.name }, 'Running as agent');
+  logger.info({ agentId: AGENT_ID, name: agentConfig.name, mcpServers: agentConfig.mcpServers ?? 'all' }, 'Running as agent');
 } else {
   // For main bot: read CLAUDE.md from CLAUDECLAW_CONFIG and inject it as
   // systemPrompt — the same pattern used by sub-agents. Never copy the file
@@ -135,7 +145,8 @@ async function main(): Promise<void> {
   setInterval(() => runDecaySweep(), 24 * 60 * 60 * 1000);
 
   // Memory consolidation: find patterns across recent memories every 30 minutes
-  if (ALLOWED_CHAT_ID && GOOGLE_API_KEY) {
+  // Only runs when GEMINI_MEMORY_ENABLED=true (disabled by default to save costs)
+  if (ALLOWED_CHAT_ID && GOOGLE_API_KEY && GEMINI_MEMORY_ENABLED) {
     // Delay first consolidation 2 minutes after startup to let things settle
     setTimeout(() => {
       void runConsolidation(ALLOWED_CHAT_ID).catch((err) =>
