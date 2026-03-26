@@ -10,6 +10,14 @@ import {
 } from './knowledge-graph.js';
 import { logger } from './logger.js';
 
+// Callback for notifying when a high-importance memory is created.
+// Set by bot.ts to send a Telegram notification suggesting /pin.
+let onHighImportanceMemory: ((memoryId: number, summary: string, importance: number) => void) | null = null;
+
+export function setHighImportanceCallback(cb: (memoryId: number, summary: string, importance: number) => void): void {
+  onHighImportanceMemory = cb;
+}
+
 // ── Legacy flat extraction (still feeds the memories table) ──────────
 
 interface ExtractionResult {
@@ -160,6 +168,11 @@ export async function ingestConversationTurn(
       }
     } catch (embErr) {
       logger.warn({ err: embErr, memoryId }, 'Failed to generate embedding for memory');
+    }
+
+    // Notify on high-importance memories so the user can /pin them
+    if (importance >= 0.8 && onHighImportanceMemory) {
+      try { onHighImportanceMemory(memoryId, result.summary, importance); } catch { /* non-fatal */ }
     }
 
     // ── Knowledge Graph: create entities + relations ────────────────

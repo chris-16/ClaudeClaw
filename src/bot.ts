@@ -12,6 +12,7 @@ import {
   DASHBOARD_TOKEN,
   DASHBOARD_URL,
   MAX_MESSAGE_LENGTH,
+  STREAM_STRATEGY,
   activeBotToken,
   agentDefaultModel,
   agentSystemPrompt,
@@ -23,14 +24,30 @@ import {
   ALERT_DAILY_COST_USD,
   ALERT_CACHE_READ_TOKENS,
 } from './config.js';
-import { clearSession, getRecentConversation, getRecentMemories, getRecentTaskOutputs, getSession, getSessionConversation, getTodayCostUsd, logToHiveMind, setSession, lookupWaChatId, saveWaMessageMap, saveTokenUsage } from './db.js';
+import { clearSession, getRecentConversation, getRecentMemories, getRecentTaskOutputs, getSession, getSessionConversation, getTodayCostUsd, logToHiveMind, pinMemory, setSession, lookupWaChatId, saveWaMessageMap, saveTokenUsage, unpinMemory } from './db.js';
 import { DailyCostLimitError } from './errors.js';
 import { logger } from './logger.js';
 import { downloadMedia, buildPhotoMessage, buildDocumentMessage, buildVideoMessage } from './media.js';
 import { buildMemoryContext, evaluateMemoryRelevance, getWorkingMemoryContext, saveConversationTurn } from './memory.js';
+import { setHighImportanceCallback } from './memory-ingest.js';
 import { messageQueue } from './message-queue.js';
 import { parseDelegation, delegateToAgent, getAvailableAgents } from './orchestrator.js';
+import {
+  isLocked,
+  lock,
+  unlock,
+  touchActivity,
+  checkKillPhrase,
+  executeEmergencyKill,
+  isSecurityEnabled,
+  getSecurityStatus,
+  audit,
+} from './security.js';
 import { emitChatEvent, setProcessing, setActiveAbort, abortActiveQuery } from './state.js';
+
+// ── Streaming rate limiter ───────────────────────────────────────────
+const globalStreamLastEdit = new Map<string, number>();
+const GLOBAL_STREAM_INTERVAL_MS = 2500;
 
 // ── Cost alerts ──────────────────────────────────────────────────────
 // Sends Telegram messages when cost thresholds are exceeded.
@@ -341,6 +358,26 @@ function isAuthorised(chatId: number): boolean {
   return chatId.toString() === ALLOWED_CHAT_ID;
 }
 
+// ── Security gates ───────────────────────────────────────────────────
+
+function securityGate(ctx: Context): string | null {
+  if (!isAuthorised(ctx.chat!.id)) return 'unauthorized';
+  if (isLocked()) return 'locked';
+  touchActivity();
+  return null;
+}
+
+/** Reply with lock message and return true if locked, false if OK. */
+async function replyIfLocked(ctx: Context): Promise<boolean> {
+  const gate = securityGate(ctx);
+  if (gate === 'unauthorized') return true; // silently reject
+  if (gate === 'locked') {
+    await ctx.reply('Session locked. Send your PIN to unlock.');
+    return true;
+  }
+  return false;
+}
+
 /**
  * Core message handler. Called for every inbound text/voice/photo/document.
  * @param forceVoiceReply  When true, always respond with audio (e.g. user sent a voice note).
@@ -363,6 +400,29 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
     );
     return;
   }
+
+  // ── Emergency kill phrase (runs even when locked) ──────────────────
+  if (checkKillPhrase(message)) {
+    audit({ agentId: AGENT_ID, chatId: chatIdStr, action: 'kill', detail: 'Emergency kill triggered', blocked: false });
+    await ctx.reply('EMERGENCY KILL activated. All agents stopping.');
+    executeEmergencyKill();
+    return;
+  }
+
+  // ── PIN lock check ─────────────────────────────────────────────────
+  if (isLocked()) {
+    if (unlock(message)) {
+      audit({ agentId: AGENT_ID, chatId: chatIdStr, action: 'unlock', detail: 'PIN accepted', blocked: false });
+      await ctx.reply('Unlocked. Session active.');
+      return;
+    }
+    audit({ agentId: AGENT_ID, chatId: chatIdStr, action: 'blocked', detail: 'Session locked, message rejected', blocked: true });
+    await ctx.reply('Session locked. Send your PIN to unlock.');
+    return;
+  }
+
+  touchActivity();
+  audit({ agentId: AGENT_ID, chatId: chatIdStr, action: 'message', detail: message.slice(0, 200), blocked: false });
 
   logger.info(
     { chatId, messageLen: message.length },
@@ -483,6 +543,33 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
       abortCtrl.abort();
     }, AGENT_TIMEOUT_MS);
 
+    // ── Streaming: send a placeholder and edit it as text arrives ────
+    let streamMsgId: number | undefined;
+    let lastEditLength = 0;
+    const streamingEnabled = STREAM_STRATEGY !== 'off';
+
+    const onStreamText = streamingEnabled ? (accumulated: string) => {
+      const now = Date.now();
+      const globalLast = globalStreamLastEdit.get(chatIdStr) ?? 0;
+      const deltaLen = accumulated.length - lastEditLength;
+      if (now - globalLast < GLOBAL_STREAM_INTERVAL_MS || deltaLen < 20) return;
+
+      let displayText = accumulated;
+      if (displayText.length > 4000) {
+        displayText = '...' + displayText.slice(displayText.length - 3900);
+      }
+      displayText += ' ▍';
+
+      globalStreamLastEdit.set(chatIdStr, now);
+      lastEditLength = accumulated.length;
+
+      if (!streamMsgId) {
+        void ctx.reply(displayText).then((sent) => { streamMsgId = sent.message_id; }).catch(() => {});
+      } else {
+        void ctx.api.editMessageText(chatId, streamMsgId, displayText).catch(() => {});
+      }
+    } : undefined;
+
     const result = await runAgent(
       fullMessage,
       sessionId,
@@ -490,11 +577,17 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
       onProgress,
       chatModelOverride.get(chatIdStr) ?? agentDefaultModel,
       abortCtrl,
+      onStreamText,
     );
 
     clearTimeout(timeoutId);
     setActiveAbort(chatIdStr, null);
     clearInterval(typingInterval);
+
+    // Clean up the streaming placeholder before sending the final formatted response
+    if (streamMsgId) {
+      try { await ctx.api.deleteMessage(chatId, streamMsgId); } catch { /* best effort */ }
+    }
 
     // Handle abort (manual /stop or timeout)
     if (result.aborted) {
@@ -711,6 +804,10 @@ export function createBot(): Bot {
     { command: 'stop', description: 'Stop current processing' },
     { command: 'agents', description: 'List available agents' },
     { command: 'delegate', description: 'Delegate task to agent' },
+    { command: 'pin', description: 'Pin a memory (never decays)' },
+    { command: 'unpin', description: 'Unpin a memory' },
+    { command: 'lock', description: 'Lock the session (PIN required)' },
+    { command: 'status', description: 'Show security status' },
   ];
   const skillCommands = discoverSkillCommands();
   const allCommands = [...builtInCommands, ...skillCommands].slice(0, 100); // Telegram limit: 100 commands
@@ -718,9 +815,17 @@ export function createBot(): Bot {
     .then(() => logger.info({ count: skillCommands.length }, 'Registered %d skill commands with Telegram', skillCommands.length))
     .catch((err) => logger.warn({ err }, 'Failed to register bot commands with Telegram'));
 
+  // Register high-importance memory callback: notify via Telegram so the user can /pin
+  if (ALLOWED_CHAT_ID) {
+    setHighImportanceCallback((memoryId, summary, importance) => {
+      const msg = `New memory #${memoryId} [${importance.toFixed(1)}]: ${summary.slice(0, 200)}\n\n/pin ${memoryId} to make permanent`;
+      bot.api.sendMessage(ALLOWED_CHAT_ID, msg).catch(() => {});
+    });
+  }
+
   // /help — list available commands
-  bot.command('help', (ctx) => {
-    if (!isAuthorised(ctx.chat!.id)) return;
+  bot.command('help', async (ctx) => {
+    if (await replyIfLocked(ctx)) return;
     return ctx.reply(
       'ClaudeClaw — Commands\n\n' +
       '/newchat — Start a new Claude session\n' +
@@ -749,8 +854,8 @@ export function createBot(): Bot {
   });
 
   // /start — simple greeting (auth-gated after setup)
-  bot.command('start', (ctx) => {
-    if (ALLOWED_CHAT_ID && !isAuthorised(ctx.chat!.id)) return;
+  bot.command('start', async (ctx) => {
+    if (await replyIfLocked(ctx)) return;
     if (AGENT_ID !== 'main') {
       return ctx.reply(`${AGENT_ID.charAt(0).toUpperCase() + AGENT_ID.slice(1)} agent online.`);
     }
@@ -759,7 +864,7 @@ export function createBot(): Bot {
 
   // /newchat — clear Claude session, start fresh + auto-commit to hive mind
   bot.command('newchat', async (ctx) => {
-    if (!isAuthorised(ctx.chat!.id)) return;
+    if (await replyIfLocked(ctx)) return;
     const chatIdStr = ctx.chat!.id.toString();
     const oldSessionId = getSession(chatIdStr, AGENT_ID);
 
@@ -822,7 +927,7 @@ export function createBot(): Bot {
 
   // /respin — after /newchat, pull recent conversation back as context
   bot.command('respin', async (ctx) => {
-    if (!isAuthorised(ctx.chat!.id)) return;
+    if (await replyIfLocked(ctx)) return;
     const chatIdStr = ctx.chat!.id.toString();
 
     // Pull the last 20 turns (10 back-and-forth exchanges) from conversation_log
@@ -849,7 +954,7 @@ export function createBot(): Bot {
 
   // /voice — toggle voice mode for this chat
   bot.command('voice', async (ctx) => {
-    if (!isAuthorised(ctx.chat!.id)) return;
+    if (await replyIfLocked(ctx)) return;
     const caps = voiceCapabilities();
     if (!caps.tts) {
       await ctx.reply('No TTS provider configured. Add ElevenLabs, Gradium, or install ffmpeg for macOS say fallback.');
@@ -867,7 +972,7 @@ export function createBot(): Bot {
 
   // /model — switch Claude model (opus, sonnet, haiku)
   bot.command('model', async (ctx) => {
-    if (!isAuthorised(ctx.chat!.id)) return;
+    if (await replyIfLocked(ctx)) return;
     const chatIdStr = ctx.chat!.id.toString();
     const arg = ctx.match?.trim().toLowerCase();
 
@@ -899,7 +1004,7 @@ export function createBot(): Bot {
 
   // /memory — show recent memories for this chat
   bot.command('memory', async (ctx) => {
-    if (!isAuthorised(ctx.chat!.id)) return;
+    if (await replyIfLocked(ctx)) return;
     const chatId = ctx.chat!.id.toString();
     const recent = getRecentMemories(chatId, 10);
     if (recent.length === 0) {
@@ -916,15 +1021,15 @@ export function createBot(): Bot {
 
   // /forget — clear session (memory decay handles the rest)
   bot.command('forget', async (ctx) => {
-    if (!isAuthorised(ctx.chat!.id)) return;
+    if (await replyIfLocked(ctx)) return;
     clearSession(ctx.chat!.id.toString(), AGENT_ID);
     await ctx.reply('Session cleared. Memories will fade naturally over time.');
   });
 
   // /wa — pull recent WhatsApp chats on demand
   bot.command('wa', async (ctx) => {
+    if (await replyIfLocked(ctx)) return;
     const chatIdStr = ctx.chat!.id.toString();
-    if (!isAuthorised(ctx.chat!.id)) return;
 
     try {
       const chats = await getWaChats(5);
@@ -956,8 +1061,8 @@ export function createBot(): Bot {
 
   // /slack — pull recent Slack conversations on demand
   bot.command('slack', async (ctx) => {
+    if (await replyIfLocked(ctx)) return;
     const chatIdStr = ctx.chat!.id.toString();
-    if (!isAuthorised(ctx.chat!.id)) return;
 
     try {
       await sendTyping(ctx.api, ctx.chat!.id);
@@ -992,7 +1097,7 @@ export function createBot(): Bot {
 
   // /dashboard — send a clickable link to the web dashboard
   bot.command('dashboard', async (ctx) => {
-    if (!isAuthorised(ctx.chat!.id)) return;
+    if (await replyIfLocked(ctx)) return;
     if (!DASHBOARD_TOKEN) {
       await ctx.reply('Dashboard not configured. Set DASHBOARD_TOKEN in .env and restart.');
       return;
@@ -1005,7 +1110,7 @@ export function createBot(): Bot {
 
   // /stop — interrupt the current agent query
   bot.command('stop', async (ctx) => {
-    if (!isAuthorised(ctx.chat!.id)) return;
+    if (await replyIfLocked(ctx)) return;
     const chatIdStr = ctx.chat!.id.toString();
     const aborted = abortActiveQuery(chatIdStr);
     if (aborted) {
@@ -1017,7 +1122,7 @@ export function createBot(): Bot {
 
   // /agents — list available agents for delegation
   bot.command('agents', async (ctx) => {
-    if (!isAuthorised(ctx.chat!.id)) return;
+    if (await replyIfLocked(ctx)) return;
     const agents = getAvailableAgents();
     if (agents.length === 0) {
       await ctx.reply('No agents configured. Add agent configs under agents/ directory.');
@@ -1034,7 +1139,7 @@ export function createBot(): Bot {
   // This command is intercepted by handleMessage's parseDelegation(),
   // but we register it so grammY doesn't pass it to the text handler.
   bot.command('delegate', async (ctx) => {
-    if (!isAuthorised(ctx.chat!.id)) return;
+    if (await replyIfLocked(ctx)) return;
     const args = ctx.match?.trim();
     if (!args) {
       const agents = getAvailableAgents();
@@ -1048,11 +1153,83 @@ export function createBot(): Bot {
     handleMessage(ctx, `/delegate ${args}`).catch((err) => logger.error({ err }, 'Delegation error'));
   });
 
+  // /pin <id> -- make a memory permanent (never decays)
+  bot.command('pin', async (ctx) => {
+    if (await replyIfLocked(ctx)) return;
+    const id = parseInt(ctx.match?.trim() || '', 10);
+    if (isNaN(id)) {
+      await ctx.reply('Usage: /pin <memory_id>\n\nUse /memory to see recent IDs.');
+      return;
+    }
+    pinMemory(id);
+    await ctx.reply(`Pinned memory #${id}. It will never decay.`);
+  });
+
+  // /unpin <id> -- remove permanent flag, memory will decay normally
+  bot.command('unpin', async (ctx) => {
+    if (await replyIfLocked(ctx)) return;
+    const id = parseInt(ctx.match?.trim() || '', 10);
+    if (isNaN(id)) {
+      await ctx.reply('Usage: /unpin <memory_id>');
+      return;
+    }
+    unpinMemory(id);
+    await ctx.reply(`Unpinned memory #${id}. It will decay normally.`);
+  });
+
+  // /lock -- manually lock the session
+  bot.command('lock', async (ctx) => {
+    if (!isAuthorised(ctx.chat!.id)) return;
+    if (!isSecurityEnabled()) {
+      await ctx.reply('PIN lock not configured. Set SECURITY_PIN_HASH in .env to enable.');
+      return;
+    }
+    lock();
+    audit({ agentId: AGENT_ID, chatId: ctx.chat!.id.toString(), action: 'lock', detail: 'Manual lock via /lock', blocked: false });
+    await ctx.reply('Session locked. Send your PIN to unlock.');
+  });
+
+  // /status -- show security status
+  bot.command('status', async (ctx) => {
+    if (!isAuthorised(ctx.chat!.id)) return;
+    const s = getSecurityStatus();
+    const lines = [
+      `PIN lock: ${s.pinEnabled ? 'enabled' : 'disabled'}`,
+      `Session: ${s.locked ? 'LOCKED' : 'unlocked'}`,
+      s.idleLockMinutes > 0 ? `Idle lock: ${s.idleLockMinutes}m` : 'Idle lock: disabled',
+      `Kill phrase: ${s.killPhraseEnabled ? 'configured' : 'disabled'}`,
+    ];
+    if (!s.locked && s.pinEnabled) {
+      const idleSec = Math.round((Date.now() - s.lastActivity) / 1000);
+      lines.push(`Last activity: ${idleSec < 60 ? idleSec + 's ago' : Math.round(idleSec / 60) + 'm ago'}`);
+    }
+    await ctx.reply(lines.join('\n'));
+  });
+
   // Text messages — and any slash commands not owned by this bot (skills, e.g. /todo /gmail)
-  const OWN_COMMANDS = new Set(['/start', '/help', '/newchat', '/respin', '/voice', '/model', '/memory', '/forget', '/chatid', '/wa', '/slack', '/dashboard', '/stop', '/agents', '/delegate']);
+  const OWN_COMMANDS = new Set(['/start', '/help', '/newchat', '/respin', '/voice', '/model', '/memory', '/forget', '/chatid', '/wa', '/slack', '/dashboard', '/stop', '/agents', '/delegate', '/pin', '/unpin', '/lock', '/status']);
   bot.on('message:text', async (ctx) => {
     const text = ctx.message.text;
     const chatIdStr = ctx.chat!.id.toString();
+
+    // ── Emergency kill phrase (runs even when locked) ──────────────
+    if (checkKillPhrase(text)) {
+      audit({ agentId: AGENT_ID, chatId: chatIdStr, action: 'kill', detail: 'Emergency kill via text handler', blocked: false });
+      await ctx.reply('EMERGENCY KILL activated. All agents stopping.');
+      executeEmergencyKill();
+      return;
+    }
+    if (isLocked()) {
+      if (unlock(text)) {
+        audit({ agentId: AGENT_ID, chatId: chatIdStr, action: 'unlock', detail: 'PIN accepted', blocked: false });
+        await ctx.reply('Unlocked. Session active.');
+        return;
+      }
+      audit({ agentId: AGENT_ID, chatId: chatIdStr, action: 'blocked', detail: 'Session locked, message rejected', blocked: true });
+      await ctx.reply('Session locked. Send your PIN to unlock.');
+      return;
+    }
+    touchActivity();
 
     if (text.startsWith('/')) {
       const cmd = text.split(/[\s@]/)[0].toLowerCase();
