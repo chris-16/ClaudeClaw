@@ -16,27 +16,29 @@ const envConfig = readEnvFile([
   'DASHBOARD_PORT',
   'DASHBOARD_TOKEN',
   'DASHBOARD_URL',
+  'CLAUDECLAW_CONFIG',
+  'DB_ENCRYPTION_KEY',
+  'GOOGLE_API_KEY',
+  'AGENT_TIMEOUT_MS',
+  'SECURITY_PIN_HASH',
+  'IDLE_LOCK_MINUTES',
+  'EMERGENCY_KILL_PHRASE',
   'DASHBOARD_SESSION_TTL_HOURS',
   'DASHBOARD_DAILY_BUDGET_USD',
   'DASHBOARD_MONTHLY_BUDGET_USD',
   'DASHBOARD_ALLOWED_IPS',
   'DASHBOARD_OTP_ENABLED',
-  'CLAUDECLAW_CONFIG',
-  'DB_ENCRYPTION_KEY',
-  'GOOGLE_API_KEY',
   'SAFE_MODE',
   'SAFE_MAX_QUERIES_PER_HOUR',
   'SAFE_MAX_COST_PER_DAY_USD',
   'SAFE_AGENT_TIMEOUT_MS',
   'SAFE_DISABLE_SCHEDULED_TASKS',
   'SAFE_DISABLE_DELEGATION',
-  'AGENT_TIMEOUT_MS',
   'FORCE_FRESH_SESSION',
   'WORKING_MEMORY_MAX_CHARS',
   'ALERT_QUERY_COST_USD',
   'ALERT_DAILY_COST_USD',
   'ALERT_CACHE_READ_TOKENS',
-  'GEMINI_MEMORY_ENABLED',
 ]);
 
 // ── Multi-agent support ──────────────────────────────────────────────
@@ -125,10 +127,12 @@ export const MAX_MESSAGE_LENGTH = 4096;
 export const TYPING_REFRESH_MS = 4000;
 
 // Maximum time (ms) an agent query can run before being auto-aborted.
-// Prevents runaway commands (e.g. recursive `find /`) from blocking the bot indefinitely.
-// Default: 5 minutes. Override via AGENT_TIMEOUT_MS in .env.
+// Safety net for truly stuck commands (e.g. recursive `find /`).
+// Default: 15 minutes. Use /stop in Telegram to manually kill a running query.
+// Previously 5 min, which caused mid-execution timeouts on bulk API work
+// (posting YouTube comments, sending multiple messages) leading to duplicate posts.
 export const AGENT_TIMEOUT_MS = parseInt(
-  process.env.AGENT_TIMEOUT_MS || envConfig.AGENT_TIMEOUT_MS || '300000',
+  process.env.AGENT_TIMEOUT_MS || envConfig.AGENT_TIMEOUT_MS || '900000',
   10,
 );
 
@@ -158,72 +162,70 @@ export const DASHBOARD_DAILY_BUDGET_USD = parseFloat(
 export const DASHBOARD_MONTHLY_BUDGET_USD = parseFloat(
   process.env.DASHBOARD_MONTHLY_BUDGET_USD || envConfig.DASHBOARD_MONTHLY_BUDGET_USD || '0',
 );
-// Comma-separated IP addresses/prefixes allowed to access the dashboard.
-// Example: "127.0.0.1,192.168.1.0" — leave empty to allow all IPs.
 export const DASHBOARD_ALLOWED_IPS =
   process.env.DASHBOARD_ALLOWED_IPS || envConfig.DASHBOARD_ALLOWED_IPS || '';
-// When true, remote logins require a one-time code sent via Telegram (2FA).
 export const DASHBOARD_OTP_ENABLED =
   (process.env.DASHBOARD_OTP_ENABLED || envConfig.DASHBOARD_OTP_ENABLED || '').toLowerCase() === 'true';
 
-// Database encryption key
+// Database encryption key (SQLCipher). Required for encrypted database access.
 export const DB_ENCRYPTION_KEY =
   process.env.DB_ENCRYPTION_KEY || envConfig.DB_ENCRYPTION_KEY || '';
 
-// Google API key for Gemini (video analysis, and optionally memory features)
+// Google API key for Gemini (memory extraction + consolidation)
 export const GOOGLE_API_KEY =
   process.env.GOOGLE_API_KEY || envConfig.GOOGLE_API_KEY || '';
 
-// Enable Gemini-powered memory features (ingest, consolidation, embeddings).
-// When false (default), GOOGLE_API_KEY is still available for video analysis
-// but background memory calls to Gemini are disabled to save costs.
-export const GEMINI_MEMORY_ENABLED =
-  (process.env.GEMINI_MEMORY_ENABLED || envConfig.GEMINI_MEMORY_ENABLED || '').toLowerCase() === 'true';
+// Streaming strategy for progressive Telegram updates.
+// 'global-throttle' (default): edits a placeholder message with streamed text,
+//   rate-limited to ~24 edits/min per chat to respect Telegram limits.
+// 'single-agent-only': streaming disabled when multiple agents are active on same chat.
+// 'off': no streaming, wait for full response.
+export type StreamStrategy = 'global-throttle' | 'single-agent-only' | 'off';
+export const STREAM_STRATEGY: StreamStrategy =
+  (process.env.STREAM_STRATEGY || 'off') as StreamStrategy;
+
+// ── Security ─────────────────────────────────────────────────────────
+// PIN lock: SHA-256 hash of your PIN. Generate: node -e "console.log(require('crypto').createHash('sha256').update('YOUR_PIN').digest('hex'))"
+export const SECURITY_PIN_HASH =
+  process.env.SECURITY_PIN_HASH || envConfig.SECURITY_PIN_HASH || '';
+
+// Auto-lock after N minutes of inactivity. 0 = disabled. Only active when PIN is set.
+export const IDLE_LOCK_MINUTES = parseInt(
+  process.env.IDLE_LOCK_MINUTES || envConfig.IDLE_LOCK_MINUTES || '0',
+  10,
+);
+
+// Emergency kill phrase. Sending this to any bot immediately stops all agents and exits.
+export const EMERGENCY_KILL_PHRASE =
+  process.env.EMERGENCY_KILL_PHRASE || envConfig.EMERGENCY_KILL_PHRASE || '';
 
 // ── Safe Mode: cost containment ──────────────────────────────────────
-// Set SAFE_MODE=true in .env to enable hard limits on Claude API usage.
-// All limits are configurable via .env and only enforced when SAFE_MODE is on.
 export const SAFE_MODE =
   (process.env.SAFE_MODE || envConfig.SAFE_MODE || '').toLowerCase() === 'true';
-
-// Max queries (runAgent calls) per agent per hour. Resets on the hour.
 export const SAFE_MAX_QUERIES_PER_HOUR = parseInt(
   process.env.SAFE_MAX_QUERIES_PER_HOUR || envConfig.SAFE_MAX_QUERIES_PER_HOUR || '20', 10,
 );
-
-// Max total cost (USD) per agent per day. Checked via token_usage table.
 export const SAFE_MAX_COST_PER_DAY_USD = parseFloat(
   process.env.SAFE_MAX_COST_PER_DAY_USD || envConfig.SAFE_MAX_COST_PER_DAY_USD || '5.00',
 );
-
-// Timeout for agent queries in safe mode (ms). Overrides AGENT_TIMEOUT_MS.
 export const SAFE_AGENT_TIMEOUT_MS = parseInt(
   process.env.SAFE_AGENT_TIMEOUT_MS || envConfig.SAFE_AGENT_TIMEOUT_MS || '45000', 10,
 );
-
-// Disable scheduled tasks in safe mode (they run unattended and burn credits)
 export const SAFE_DISABLE_SCHEDULED_TASKS =
   (process.env.SAFE_DISABLE_SCHEDULED_TASKS || envConfig.SAFE_DISABLE_SCHEDULED_TASKS || 'true').toLowerCase() === 'true';
-
-// Disable agent delegation in safe mode (prevents cascading multi-agent costs)
 export const SAFE_DISABLE_DELEGATION =
   (process.env.SAFE_DISABLE_DELEGATION || envConfig.SAFE_DISABLE_DELEGATION || 'true').toLowerCase() === 'true';
 
 // ── Session control ──────────────────────────────────────────────────
-// Force fresh sessions: never resume a previous session. Eliminates cache_read
-// costs (~80% of per-query spend). Working memory provides context continuity.
 export const FORCE_FRESH_SESSION =
   (process.env.FORCE_FRESH_SESSION || envConfig.FORCE_FRESH_SESSION || '').toLowerCase() === 'true';
 
 // ── Working Memory ───────────────────────────────────────────────────
-// Max chars for working memory summary injected into each fresh query.
-// Keeps context continuity without resuming expensive sessions.
 export const WORKING_MEMORY_MAX_CHARS = parseInt(
   process.env.WORKING_MEMORY_MAX_CHARS || envConfig.WORKING_MEMORY_MAX_CHARS || '2000', 10,
 );
 
 // ── Cost Alerts ──────────────────────────────────────────────────────
-// Telegram alerts when cost thresholds are exceeded. Set to 0 to disable.
 export const ALERT_QUERY_COST_USD = parseFloat(
   process.env.ALERT_QUERY_COST_USD || envConfig.ALERT_QUERY_COST_USD || '1.00',
 );
