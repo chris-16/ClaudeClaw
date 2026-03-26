@@ -161,6 +161,11 @@ const voiceEnabledChats = new Set<string>();
 // When not set, uses CLI default (Opus via Max/OAuth)
 const chatModelOverride = new Map<string, string>();
 
+/** Allow the dashboard to set the model override for the main chat. */
+export function setMainModelOverride(model: string): void {
+  if (ALLOWED_CHAT_ID) chatModelOverride.set(ALLOWED_CHAT_ID, model);
+}
+
 const AVAILABLE_MODELS: Record<string, string> = {
   opus: 'claude-opus-4-6',
   sonnet: 'claude-sonnet-4-5',
