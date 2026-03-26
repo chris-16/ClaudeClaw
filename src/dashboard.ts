@@ -5,7 +5,7 @@ import { serve } from '@hono/node-server';
 
 import fs from 'fs';
 import path from 'path';
-import { AGENT_ID, ALLOWED_CHAT_ID, DASHBOARD_PORT, DASHBOARD_TOKEN, PROJECT_ROOT, STORE_DIR, WHATSAPP_ENABLED, SLACK_USER_TOKEN, CONTEXT_LIMIT, agentDefaultModel } from './config.js';
+import { AGENT_ID, ALLOWED_CHAT_ID, DASHBOARD_PORT, DASHBOARD_TOKEN, DASHBOARD_DAILY_BUDGET_USD, DASHBOARD_MONTHLY_BUDGET_USD, PROJECT_ROOT, SAFE_MAX_COST_PER_DAY_USD, STORE_DIR, WHATSAPP_ENABLED, SLACK_USER_TOKEN, CONTEXT_LIMIT, agentDefaultModel } from './config.js';
 import crypto from 'crypto';
 import {
   getAllScheduledTasks,
@@ -37,13 +37,22 @@ import {
   assignMissionTask,
   getUnassignedMissionTasks,
   getMissionTaskHistory,
+  getActivityLog,
+  getAgentCostBreakdown,
+  getAppSetting,
+  getAppSettingMeta,
   getAuditLog,
   getAuditLogCount,
   getRecentBlockedActions,
+  getTodayCostUsd,
+  getTopCostlyQueries,
+  logActivity,
+  setAppSetting,
 } from './db.js';
 import { generateContent, parseJsonResponse } from './gemini.js';
 import { getSecurityStatus } from './security.js';
 import { listAgentIds, loadAgentConfig, setAgentModel } from './agent-config.js';
+import { listSkills, toggleSkill } from './skills-manager.js';
 import {
   listTemplates,
   validateAgentId,
@@ -581,6 +590,139 @@ export function startDashboard(botApi?: Api<RawApi>): void {
     const limit = parseInt(c.req.query('limit') || '20', 10);
     const entries = getHiveMindEntries(limit, agentId || undefined);
     return c.json({ entries });
+  });
+
+  // ── Budget ──────────────────────────────────────────────────────────
+
+  const getMonthlyCost = (chatId: string) =>
+    getDashboardCostTimeline(chatId, 30).reduce((s, d) => s + d.cost, 0);
+
+  app.get('/api/budget', (c) => {
+    const chatId = c.req.query('chatId') || ALLOWED_CHAT_ID || '';
+    const stats = getDashboardTokenStats(chatId);
+    const monthlySpent = getMonthlyCost(chatId);
+    const daily = DASHBOARD_DAILY_BUDGET_USD > 0
+      ? { spent: stats.todayCost, limit: DASHBOARD_DAILY_BUDGET_USD, pct: Math.round((stats.todayCost / DASHBOARD_DAILY_BUDGET_USD) * 100) }
+      : null;
+    const monthly = DASHBOARD_MONTHLY_BUDGET_USD > 0
+      ? { spent: monthlySpent, limit: DASHBOARD_MONTHLY_BUDGET_USD, pct: Math.round((monthlySpent / DASHBOARD_MONTHLY_BUDGET_USD) * 100) }
+      : null;
+    return c.json({ daily, monthly });
+  });
+
+  // ── Cost Control ─────────────────────────────────────────────────────
+
+  app.get('/api/cost-control', (c) => {
+    const dbMeta = getAppSettingMeta('SAFE_MAX_COST_PER_DAY_USD');
+    const envLimit = SAFE_MAX_COST_PER_DAY_USD;
+    const effectiveLimit = dbMeta !== undefined ? parseFloat(dbMeta.value) : envLimit;
+    const todaySpend = getTodayCostUsd();
+    const pct = effectiveLimit > 0 ? Math.round((todaySpend / effectiveLimit) * 100) : 0;
+    return c.json({
+      limit: effectiveLimit,
+      source: dbMeta !== undefined ? 'dashboard' : 'env',
+      envDefault: envLimit,
+      todaySpend,
+      pct,
+      updatedAt: dbMeta?.updated_at ?? null,
+    });
+  });
+
+  app.post('/api/cost-control', async (c) => {
+    const body = await c.req.json<{ limit?: number }>().catch(() => ({}));
+    const limit = 'limit' in body ? body.limit : undefined;
+    if (limit === undefined || typeof limit !== 'number' || limit < 0 || limit > 1000) {
+      return c.json({ error: 'Invalid limit. Must be a number between 0 and 1000.' }, 400);
+    }
+    setAppSetting('SAFE_MAX_COST_PER_DAY_USD', limit.toString());
+    logActivity('cost_limit_updated', `Daily cost limit set to $${limit.toFixed(2)} from dashboard`);
+    logger.info({ newLimit: limit }, 'Daily cost limit updated from dashboard');
+    return c.json({ ok: true, limit });
+  });
+
+  app.get('/api/cost-breakdown', (c) => {
+    return c.json({
+      today: getAgentCostBreakdown(1),
+      week: getAgentCostBreakdown(7),
+      outliers: getTopCostlyQueries(10, 7),
+    });
+  });
+
+  // ── MCP Status ────────────────────────────────────────────────────────
+
+  app.get('/api/mcp-status', async (c) => {
+    const mcps = [
+      { id: 'coach', name: 'Coach MCP', type: 'remote' as const, url: 'https://mac-mini-de-chris.tail8b8656.ts.net/mcp', description: 'WHOOP, Hevy, Apple Health' },
+      { id: 'notion', name: 'Notion', type: 'remote' as const, url: 'https://mcp.notion.com/mcp', description: 'Workspace, pages, databases' },
+      { id: 'ynab', name: 'YNAB', type: 'local' as const, script: '/Users/chris/ynab-mcp/start-ynab-mcp.sh', entry: '/Users/chris/ynab-mcp/server.mjs', description: 'Budget, transactions, spending' },
+      { id: 'caldav', name: 'CalDAV', type: 'local' as const, script: path.join(PROJECT_ROOT, 'scripts/start-caldav-mcp.sh'), entry: path.join(PROJECT_ROOT, 'caldav-mcp/dist/index.js'), description: 'Yandex Calendar events' },
+    ];
+
+    const results = await Promise.all(mcps.map(async (mcp) => {
+      const base = { id: mcp.id, name: mcp.name, description: mcp.description, type: mcp.type };
+      try {
+        if (mcp.type === 'remote') {
+          const controller = new AbortController();
+          const start = Date.now();
+          const timeout = setTimeout(() => controller.abort(), 8000);
+          const res = await fetch(mcp.url, { method: 'GET', signal: controller.signal }).catch(() => null);
+          clearTimeout(timeout);
+          const latencyMs = Date.now() - start;
+          if (!res) return { ...base, status: 'down', latencyMs, error: 'Connection timeout' };
+          return { ...base, status: 'up', latencyMs, httpStatus: res.status };
+        } else {
+          const scriptExists = fs.existsSync(mcp.script);
+          const entryExists = fs.existsSync(mcp.entry);
+          if (!scriptExists) return { ...base, status: 'down', error: `Script missing: ${mcp.script}` };
+          if (!entryExists) return { ...base, status: 'down', error: `Entry missing: ${mcp.entry}` };
+          const { execFile } = await import('child_process');
+          const result = await new Promise<{ status: string; latencyMs: number; error?: string }>((resolve) => {
+            const start = Date.now();
+            const proc = execFile(mcp.script, [], { timeout: 10000, env: { ...process.env } });
+            let output = '';
+            let settled = false;
+            const done = (status: string, error?: string) => {
+              if (settled) return;
+              settled = true;
+              proc.kill();
+              resolve({ status, latencyMs: Date.now() - start, error });
+            };
+            proc.stdout?.on('data', (d: Buffer) => { output += d.toString(); if (output.includes('"jsonrpc"')) done('up'); });
+            proc.stderr?.on('data', () => {});
+            proc.on('error', (e) => done('down', e.message));
+            proc.on('close', (code) => { if (!settled) { const isUp = code === 0 || output.includes('"jsonrpc"'); done(isUp ? 'up' : 'down', isUp ? undefined : `Exit code: ${code}`); } });
+            const initMsg = JSON.stringify({ jsonrpc: '2.0', method: 'initialize', id: 1, params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'health-check', version: '1.0' } } });
+            proc.stdin?.write(`Content-Length: ${Buffer.byteLength(initMsg)}\r\n\r\n${initMsg}`);
+            proc.stdin?.end();
+            setTimeout(() => done('timeout', 'No response within 10s'), 10000);
+          });
+          return { ...base, ...result };
+        }
+      } catch (e: unknown) {
+        return { ...base, status: 'down', error: e instanceof Error ? e.message : 'Unknown error' };
+      }
+    }));
+    return c.json({ mcps: results, checkedAt: Math.floor(Date.now() / 1000) });
+  });
+
+  // ── Skills ──────────────────────────────────────────────────────────────
+
+  app.get('/api/skills', (c) => c.json({ skills: listSkills() }));
+
+  app.post('/api/skills/:name/toggle', (c) => {
+    const name = c.req.param('name');
+    const result = toggleSkill(name);
+    if (!result.ok) return c.json({ error: result.error }, 404);
+    logActivity('skill_toggled', `Skill "${name}" ${result.enabled ? 'enabled' : 'disabled'}`);
+    return c.json({ ok: true, enabled: result.enabled });
+  });
+
+  // ── Activity ───────────────────────────────────────────────────────────
+
+  app.get('/api/activity', (c) => {
+    const limit = parseInt(c.req.query('limit') || '50', 10);
+    const offset = parseInt(c.req.query('offset') || '0', 10);
+    return c.json({ entries: getActivityLog(limit, offset, c.req.query('type') || undefined) });
   });
 
   // ── Chat endpoints ─────────────────────────────────────────────────
