@@ -3,9 +3,44 @@ import path from 'path';
 
 import { query } from '@anthropic-ai/claude-agent-sdk';
 
-import { PROJECT_ROOT, agentCwd } from './config.js';
+import { PROJECT_ROOT, agentCwd, AGENT_ID, SAFE_MODE, SAFE_MAX_QUERIES_PER_HOUR, SAFE_MAX_COST_PER_DAY_USD, SAFE_AGENT_TIMEOUT_MS, AGENT_TIMEOUT_MS } from './config.js';
+import { getAppSetting, getTodayCostUsd } from './db.js';
+import { DailyCostLimitError } from './errors.js';
 import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
+
+// ── Safe Mode: per-hour query rate limiter ───────────────────────────
+// Tracks queries per agent per clock-hour. Resets when the hour changes.
+const queryCounters = new Map<string, { hour: number; count: number }>();
+
+function checkSafeModeRateLimit(agentId: string): void {
+  if (!SAFE_MODE) return;
+  const now = new Date();
+  const currentHour = now.getFullYear() * 1000000 + now.getMonth() * 10000 + now.getDate() * 100 + now.getHours();
+  const entry = queryCounters.get(agentId) ?? { hour: currentHour, count: 0 };
+  if (entry.hour !== currentHour) {
+    entry.hour = currentHour;
+    entry.count = 0;
+  }
+  entry.count++;
+  queryCounters.set(agentId, entry);
+  if (entry.count > SAFE_MAX_QUERIES_PER_HOUR) {
+    const msg = `[SAFE MODE] Agent "${agentId}" hit rate limit: ${entry.count}/${SAFE_MAX_QUERIES_PER_HOUR} queries this hour. Blocking until next hour.`;
+    logger.warn(msg);
+    throw new Error(msg);
+  }
+
+  // Daily cost enforcement (DB override takes precedence over .env)
+  const dbOverride = getAppSetting('SAFE_MAX_COST_PER_DAY_USD');
+  const effectiveLimit = dbOverride !== undefined ? parseFloat(dbOverride) : SAFE_MAX_COST_PER_DAY_USD;
+  if (effectiveLimit > 0) {
+    const todayCost = getTodayCostUsd();
+    if (todayCost >= effectiveLimit) {
+      logger.warn(`[SAFE MODE] Daily spend $${todayCost.toFixed(2)} hit limit $${effectiveLimit.toFixed(2)}. Blocking queries until tomorrow.`);
+      throw new DailyCostLimitError(todayCost, effectiveLimit);
+    }
+  }
+}
 
 // ── MCP server loading ──────────────────────────────────────────────
 // The Agent SDK's settingSources loads CLAUDE.md and permissions from
@@ -168,6 +203,16 @@ export async function runAgent(
   abortController?: AbortController,
   mcpAllowlist?: string[],
 ): Promise<AgentResult> {
+  // ── Safe Mode: rate limit check ──
+  checkSafeModeRateLimit(AGENT_ID);
+
+  // In safe mode, enforce shorter timeout via a local AbortController
+  if (SAFE_MODE && !abortController) {
+    abortController = new AbortController();
+    setTimeout(() => abortController!.abort(), SAFE_AGENT_TIMEOUT_MS);
+    logger.info({ safeTimeout: SAFE_AGENT_TIMEOUT_MS }, '[SAFE MODE] Enforcing reduced timeout');
+  }
+
   // Read secrets from .env without polluting process.env.
   // CLAUDE_CODE_OAUTH_TOKEN is optional — the subprocess finds auth via ~/.claude/
   // automatically. Only needed if you want to override which account is used.
@@ -188,22 +233,30 @@ export async function runAgent(
   let preCompactTokens: number | null = null;
   let lastCallCacheRead = 0;
   let lastCallInputTokens = 0;
+  let modelCallCount = 0;   // ── Safe Mode instrumentation: count API calls within this query
+  let toolUseCount = 0;     // ── count tool uses
 
   // Refresh typing indicator on an interval while Claude works.
   // Telegram's "typing..." action expires after ~5s.
   const typingInterval = setInterval(onTyping, 4000);
 
   try {
-    // Load MCP servers from project + user settings files, filtered by agent allowlist
-    const mcpServers = loadMcpServers(mcpAllowlist);
-    const mcpServerNames = Object.keys(mcpServers);
+    // Always include both 'project' and 'user' settingSources.
+    // Agents with MCP allowlists have their own .claude/settings.json containing
+    // only their permitted MCPs, so no extra filtering is needed.
+    // 'user' is required for the SDK to load MCP servers correctly.
+    const sources: Array<'project' | 'user'> = ['project', 'user'];
+
     logger.info(
-      { sessionId: sessionId ?? 'new', messageLen: message.length, mcpServers: mcpServerNames },
+      { sessionId: sessionId ?? 'new', messageLen: message.length, settingSources: sources, mcpAllowlist: mcpAllowlist ?? 'all' },
       'Starting agent query',
     );
 
-    // SDK Options.mcpServers expects Record<string, McpServerConfig>
-    const mcpServerSpecs = mcpServerNames.length > 0 ? mcpServers : undefined;
+    // Load MCP servers from project + user settings.json files.
+    // The Agent SDK's settingSources loads CLAUDE.md and permissions but does NOT
+    // load mcpServers — we must pass them explicitly via the mcpServers option.
+    const mcpServers = loadMcpServers(mcpAllowlist);
+    logger.info({ mcpServerCount: Object.keys(mcpServers).length, mcpNames: Object.keys(mcpServers) }, 'Loaded MCP servers');
 
     for await (const event of query({
       prompt: singleTurn(message),
@@ -215,8 +268,11 @@ export async function runAgent(
         // Resume the previous session for this chat (persistent context)
         resume: sessionId,
 
-        // 'project' loads CLAUDE.md from cwd; 'user' loads ~/.claude/skills/ and user settings
-        settingSources: ['project', 'user'],
+        // 'project' loads CLAUDE.md + settings from cwd; 'user' loads ~/.claude/ (skills, MCPs, etc.)
+        settingSources: sources,
+
+        // MCP servers loaded from project + user settings.json
+        mcpServers,
 
         // Skip all permission prompts — this is a trusted personal bot on your own machine
         permissionMode: 'bypassPermissions',
@@ -224,9 +280,6 @@ export async function runAgent(
 
         // Pass secrets to the subprocess without polluting our own process.env
         env: sdkEnv,
-
-        // MCP servers loaded from .claude/settings.json and ~/.claude/settings.json
-        ...(mcpServerSpecs ? { mcpServers: mcpServerSpecs } : {}),
 
         // Model override (e.g. 'claude-haiku-4-5', 'claude-sonnet-4-5')
         ...(model ? { model } : {}),
@@ -257,6 +310,7 @@ export async function runAgent(
       // Each assistant message represents one API call; its usage reflects
       // that single call's context size (not cumulative across the turn).
       if (ev['type'] === 'assistant') {
+        modelCallCount++;
         const msgUsage = (ev['message'] as Record<string, unknown>)?.['usage'] as Record<string, number> | undefined;
         const callCacheRead = msgUsage?.['cache_read_input_tokens'] ?? 0;
         const callInputTokens = msgUsage?.['input_tokens'] ?? 0;
@@ -265,6 +319,14 @@ export async function runAgent(
         }
         if (callInputTokens > 0) {
           lastCallInputTokens = callInputTokens;
+        }
+
+        // Count tool uses from assistant content blocks
+        const content = (ev['message'] as Record<string, unknown>)?.['content'] as Array<{ type: string }> | undefined;
+        if (Array.isArray(content)) {
+          for (const block of content) {
+            if (block.type === 'tool_use') toolUseCount++;
+          }
         }
       }
 
@@ -331,6 +393,11 @@ export async function runAgent(
     throw err;
   } finally {
     clearInterval(typingInterval);
+    // ── Per-query instrumentation log ──
+    logger.info(
+      { agentId: AGENT_ID, sessionType: sessionId ? 'resumed' : 'fresh', modelCalls: modelCallCount, toolUses: toolUseCount, cacheRead: lastCallCacheRead, inputTokens: lastCallInputTokens, costUsd: usage?.totalCostUsd ?? 0 },
+      'Agent query completed',
+    );
   }
 
   return { text: resultText, newSessionId, usage };
