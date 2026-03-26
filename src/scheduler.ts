@@ -1,6 +1,6 @@
 import { CronExpressionParser } from 'cron-parser';
 
-import { AGENT_ID, ALLOWED_CHAT_ID, agentMcpAllowlist } from './config.js';
+import { AGENT_ID, ALLOWED_CHAT_ID, SAFE_MODE, SAFE_DISABLE_SCHEDULED_TASKS } from './config.js';
 import {
   getDueTasks,
   getSession,
@@ -51,6 +51,11 @@ export function initScheduler(send: Sender, agentId = 'main'): void {
 }
 
 async function runDueTasks(): Promise<void> {
+  // ── Safe Mode: block all scheduled tasks to prevent unattended credit burn
+  if (SAFE_MODE && SAFE_DISABLE_SCHEDULED_TASKS) {
+    return; // silently skip — don't even check for due tasks
+  }
+
   const tasks = getDueTasks(schedulerAgentId);
   if (tasks.length === 0) return;
 
@@ -83,7 +88,7 @@ async function runDueTasks(): Promise<void> {
         await sender(`Scheduled task running: "${task.prompt.slice(0, 80)}${task.prompt.length > 80 ? '...' : ''}"`);
 
         // Run as a fresh agent call (no session — scheduled tasks are autonomous)
-        const result = await runAgent(task.prompt, undefined, () => {}, undefined, undefined, abortController, agentMcpAllowlist);
+        const result = await runAgent(task.prompt, undefined, () => {}, undefined, undefined, abortController);
         clearTimeout(timeout);
 
         if (result.aborted) {

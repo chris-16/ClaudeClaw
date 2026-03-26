@@ -4,15 +4,16 @@ import path from 'path';
 import { loadAgentConfig, resolveAgentDir, resolveAgentClaudeMd } from './agent-config.js';
 import { createBot } from './bot.js';
 import { checkPendingMigrations } from './migrations.js';
-import { ALLOWED_CHAT_ID, activeBotToken, STORE_DIR, PROJECT_ROOT, CLAUDECLAW_CONFIG, GEMINI_MEMORY_ENABLED, GOOGLE_API_KEY, setAgentOverrides, SAFE_MODE, SAFE_MAX_QUERIES_PER_HOUR, SAFE_MAX_COST_PER_DAY_USD, SAFE_AGENT_TIMEOUT_MS, SAFE_DISABLE_SCHEDULED_TASKS, SAFE_DISABLE_DELEGATION } from './config.js';
+import { ALLOWED_CHAT_ID, activeBotToken, STORE_DIR, PROJECT_ROOT, CLAUDECLAW_CONFIG, GOOGLE_API_KEY, SECURITY_PIN_HASH, IDLE_LOCK_MINUTES, EMERGENCY_KILL_PHRASE, setAgentOverrides, SAFE_MODE, SAFE_MAX_QUERIES_PER_HOUR, SAFE_MAX_COST_PER_DAY_USD, SAFE_AGENT_TIMEOUT_MS, SAFE_DISABLE_SCHEDULED_TASKS, SAFE_DISABLE_DELEGATION } from './config.js';
 import { startDashboard } from './dashboard.js';
-import { initDatabase } from './db.js';
+import { initDatabase, cleanupOldMissionTasks, insertAuditLog } from './db.js';
 import { logger } from './logger.js';
 import { cleanupOldUploads } from './media.js';
 import { runConsolidation } from './memory-consolidate.js';
 import { runDecaySweep } from './memory.js';
 import { initOrchestrator } from './orchestrator.js';
 import { initScheduler } from './scheduler.js';
+import { initSecurity, setAuditCallback } from './security.js';
 import { setTelegramConnected, setBotInfo } from './state.js';
 
 // Parse --agent flag
@@ -139,26 +140,46 @@ async function main(): Promise<void> {
   initDatabase();
   logger.info('Database ready');
 
+  // ── Security init ──
+  initSecurity({
+    pinHash: SECURITY_PIN_HASH,
+    idleLockMinutes: IDLE_LOCK_MINUTES,
+    killPhrase: EMERGENCY_KILL_PHRASE,
+  });
+  setAuditCallback((entry) => {
+    insertAuditLog(entry.agentId, entry.chatId, entry.action, entry.detail, entry.blocked);
+  });
+
   initOrchestrator();
 
-  runDecaySweep();
-  setInterval(() => runDecaySweep(), 24 * 60 * 60 * 1000);
+  // Decay, consolidation, and mission cleanup only run on the main agent
+  if (AGENT_ID === 'main') {
+    runDecaySweep();
+    setInterval(() => runDecaySweep(), 24 * 60 * 60 * 1000);
 
-  // Memory consolidation: find patterns across recent memories every 30 minutes
-  // Only runs when GEMINI_MEMORY_ENABLED=true (disabled by default to save costs)
-  if (ALLOWED_CHAT_ID && GOOGLE_API_KEY && GEMINI_MEMORY_ENABLED) {
-    // Delay first consolidation 2 minutes after startup to let things settle
-    setTimeout(() => {
-      void runConsolidation(ALLOWED_CHAT_ID).catch((err) =>
-        logger.error({ err }, 'Initial consolidation failed'),
-      );
-    }, 2 * 60 * 1000);
-    setInterval(() => {
-      void runConsolidation(ALLOWED_CHAT_ID).catch((err) =>
-        logger.error({ err }, 'Periodic consolidation failed'),
-      );
-    }, 30 * 60 * 1000);
-    logger.info('Memory consolidation enabled (every 30 min)');
+    // Memory consolidation: find patterns across recent memories every 30 minutes
+    // Runs automatically when GOOGLE_API_KEY is available
+    if (ALLOWED_CHAT_ID && GOOGLE_API_KEY) {
+      // Delay first consolidation 2 minutes after startup to let things settle
+      setTimeout(() => {
+        void runConsolidation(ALLOWED_CHAT_ID).catch((err) =>
+          logger.error({ err }, 'Initial consolidation failed'),
+        );
+      }, 2 * 60 * 1000);
+      setInterval(() => {
+        void runConsolidation(ALLOWED_CHAT_ID).catch((err) =>
+          logger.error({ err }, 'Periodic consolidation failed'),
+        );
+      }, 30 * 60 * 1000);
+      logger.info('Memory consolidation enabled (every 30 min)');
+    }
+
+    // Clean up completed/failed mission tasks older than 7 days
+    cleanupOldMissionTasks(7);
+  } else {
+    // Sub-agents still run decay for their own memories
+    runDecaySweep();
+    setInterval(() => runDecaySweep(), 24 * 60 * 60 * 1000);
   }
 
   cleanupOldUploads();

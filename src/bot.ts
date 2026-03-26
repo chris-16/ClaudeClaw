@@ -14,18 +14,71 @@ import {
   MAX_MESSAGE_LENGTH,
   activeBotToken,
   agentDefaultModel,
-  agentMcpAllowlist,
   agentSystemPrompt,
   TYPING_REFRESH_MS,
   AGENT_TIMEOUT_MS,
+  SAFE_MODE,
+  FORCE_FRESH_SESSION,
+  ALERT_QUERY_COST_USD,
+  ALERT_DAILY_COST_USD,
+  ALERT_CACHE_READ_TOKENS,
 } from './config.js';
-import { clearSession, getRecentConversation, getRecentMemories, getRecentTaskOutputs, getSession, getSessionConversation, logToHiveMind, setSession, lookupWaChatId, saveWaMessageMap, saveTokenUsage } from './db.js';
+import { clearSession, getRecentConversation, getRecentMemories, getRecentTaskOutputs, getSession, getSessionConversation, getTodayCostUsd, logToHiveMind, setSession, lookupWaChatId, saveWaMessageMap, saveTokenUsage } from './db.js';
+import { DailyCostLimitError } from './errors.js';
 import { logger } from './logger.js';
 import { downloadMedia, buildPhotoMessage, buildDocumentMessage, buildVideoMessage } from './media.js';
-import { buildMemoryContext, saveConversationTurn } from './memory.js';
+import { buildMemoryContext, getWorkingMemoryContext, saveConversationTurn } from './memory.js';
 import { messageQueue } from './message-queue.js';
 import { parseDelegation, delegateToAgent, getAvailableAgents } from './orchestrator.js';
 import { emitChatEvent, setProcessing, setActiveAbort, abortActiveQuery } from './state.js';
+
+// ── Cost alerts ──────────────────────────────────────────────────────
+// Sends Telegram messages when cost thresholds are exceeded.
+// Deduplicates daily cost alert (fires once per day).
+let dailyAlertFiredDate = '';
+
+async function checkCostAlerts(
+  botApi: Api<RawApi>,
+  chatId: string,
+  queryCostUsd: number,
+  cacheRead: number,
+  sessionResumed: boolean,
+): Promise<void> {
+  const alerts: string[] = [];
+
+  // Per-query cost alert
+  if (ALERT_QUERY_COST_USD > 0 && queryCostUsd >= ALERT_QUERY_COST_USD) {
+    alerts.push(`Query cost $${queryCostUsd.toFixed(2)} exceeded $${ALERT_QUERY_COST_USD} limit`);
+  }
+
+  // Cache read alert (unexpected resumed session)
+  if (ALERT_CACHE_READ_TOKENS > 0 && cacheRead >= ALERT_CACHE_READ_TOKENS) {
+    alerts.push(`cache_read ${(cacheRead / 1000).toFixed(0)}k tokens (limit: ${(ALERT_CACHE_READ_TOKENS / 1000).toFixed(0)}k)`);
+  }
+
+  // Resumed session alert in fresh mode
+  if (FORCE_FRESH_SESSION && sessionResumed) {
+    alerts.push(`Session was RESUMED despite FORCE_FRESH_SESSION=true`);
+  }
+
+  // Daily cost alert (fires once per calendar day)
+  const today = new Date().toISOString().slice(0, 10);
+  if (ALERT_DAILY_COST_USD > 0 && dailyAlertFiredDate !== today) {
+    const dailyCost = getTodayCostUsd();
+    if (dailyCost >= ALERT_DAILY_COST_USD) {
+      alerts.push(`Daily spend $${dailyCost.toFixed(2)} exceeded $${ALERT_DAILY_COST_USD} limit`);
+      dailyAlertFiredDate = today;
+    }
+  }
+
+  if (alerts.length > 0) {
+    const msg = `COST ALERT [${AGENT_ID}]\n${alerts.map(a => `- ${a}`).join('\n')}`;
+    logger.warn({ alerts, agentId: AGENT_ID }, 'Cost alert triggered');
+    try {
+      await botApi.sendMessage(parseInt(chatId), msg);
+    } catch { /* best effort */ }
+  }
+}
 
 // ── Context window tracking ──────────────────────────────────────────
 // Uses input_tokens from the last API call (= actual context window size:
@@ -358,27 +411,41 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
     return;
   }
 
-  // Build memory context and prepend to message
-  const memCtx = await buildMemoryContext(chatIdStr, message);
+  // Build context to prepend to message
   const parts: string[] = [];
-  if (agentSystemPrompt) parts.push(`[Agent role — follow these instructions]\n${agentSystemPrompt}\n[End agent role]`);
-  if (memCtx) parts.push(memCtx);
 
-  // Inject recent scheduled task outputs so the user can reply to them naturally.
-  // Without this, Claude has no idea what a scheduled task just showed the user.
-  const recentTasks = getRecentTaskOutputs(AGENT_ID, 30);
-  if (recentTasks.length > 0) {
-    const taskLines = recentTasks.map((t) => {
-      const ago = Math.round((Date.now() / 1000 - t.last_run) / 60);
-      return `[Scheduled task ran ${ago}m ago]\nTask: ${t.prompt}\nOutput:\n${t.last_result}`;
-    });
-    parts.push(`[Recent scheduled task context — the user may be replying to this]\n${taskLines.join('\n\n')}\n[End task context]`);
+  if (FORCE_FRESH_SESSION) {
+    // Fresh session mode: use working memory instead of full memory context / system prompt
+    // System prompt is loaded via settingSources (CLAUDE.md), so no need to inject it again
+    const wmCtx = getWorkingMemoryContext(chatIdStr, AGENT_ID);
+    if (wmCtx) parts.push(wmCtx);
+  } else {
+    // Legacy mode: full memory context + system prompt injection
+    const memCtx = SAFE_MODE ? '' : await buildMemoryContext(chatIdStr, message);
+    if (agentSystemPrompt && !SAFE_MODE) parts.push(`[Agent role — follow these instructions]\n${agentSystemPrompt}\n[End agent role]`);
+    if (memCtx) parts.push(memCtx);
+
+    // Inject recent scheduled task outputs
+    if (!SAFE_MODE) {
+      const recentTasks = getRecentTaskOutputs(AGENT_ID, 30);
+      if (recentTasks.length > 0) {
+        const taskLines = recentTasks.map((t) => {
+          const ago = Math.round((Date.now() / 1000 - t.last_run) / 60);
+          return `[Scheduled task ran ${ago}m ago]\nTask: ${t.prompt}\nOutput:\n${t.last_result}`;
+        });
+        parts.push(`[Recent scheduled task context — the user may be replying to this]\n${taskLines.join('\n\n')}\n[End task context]`);
+      }
+    }
   }
 
   parts.push(message);
   const fullMessage = parts.join('\n\n');
 
-  const sessionId = getSession(chatIdStr, AGENT_ID);
+  // Log prompt size for cost tracking
+  logger.info({ promptChars: fullMessage.length, freshSession: FORCE_FRESH_SESSION, agentId: AGENT_ID }, 'Prompt composed');
+
+  // Session control: fresh session skips resume to avoid expensive cache_read
+  const sessionId = FORCE_FRESH_SESSION ? undefined : getSession(chatIdStr, AGENT_ID);
 
   // Start typing immediately, then refresh on interval
   await sendTyping(ctx.api, chatId);
@@ -420,7 +487,6 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
       onProgress,
       chatModelOverride.get(chatIdStr) ?? agentDefaultModel,
       abortCtrl,
-      agentMcpAllowlist,
     );
 
     clearTimeout(timeoutId);
@@ -438,7 +504,7 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
       return;
     }
 
-    if (result.newSessionId) {
+    if (!FORCE_FRESH_SESSION && result.newSessionId) {
       setSession(chatIdStr, result.newSessionId, AGENT_ID);
       logger.info({ newSessionId: result.newSessionId }, 'Session saved');
     }
@@ -523,6 +589,15 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
       if (warning) {
         await ctx.reply(warning);
       }
+
+      // Cost alerts
+      await checkCostAlerts(
+        ctx.api,
+        chatIdStr,
+        result.usage.totalCostUsd,
+        result.usage.lastCallCacheRead,
+        !!sessionId, // sessionId is defined = session was resumed
+      );
     }
 
     setProcessing(chatIdStr, false);
@@ -532,22 +607,25 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
     setProcessing(chatIdStr, false);
     logger.error({ err }, 'Agent error');
 
+    // Daily cost limit — friendly message, not a generic error
+    if (err instanceof DailyCostLimitError) {
+      await ctx.reply(err.userMessage);
     // Detect context window exhaustion (process exits with code 1 after long sessions)
-    const errMsg = err instanceof Error ? err.message : String(err);
-    if (errMsg.includes('exited with code 1')) {
-      const usage = lastUsage.get(chatIdStr);
-      const contextSize = usage?.lastCallInputTokens || usage?.lastCallCacheRead || 0;
-      if (contextSize > 0) {
-        // We have prior usage data — context exhaustion is plausible
-        await ctx.reply(
-          `Context window likely exhausted. Last known context: ~${Math.round(contextSize / 1000)}k tokens.\n\nUse /newchat to start fresh, then /respin to pull recent conversation back in.`,
-        );
-      } else {
-        // No prior usage — likely a subprocess init failure, not context exhaustion
-        await ctx.reply('Claude Code subprocess failed to start. Check logs or try /newchat.');
-      }
     } else {
-      await ctx.reply('Something went wrong. Check the logs and try again.');
+      const errMsg = err instanceof Error ? err.message : String(err);
+      if (errMsg.includes('exited with code 1')) {
+        const usage = lastUsage.get(chatIdStr);
+        const contextSize = usage?.lastCallInputTokens || usage?.lastCallCacheRead || 0;
+        if (contextSize > 0) {
+          await ctx.reply(
+            `Context window likely exhausted. Last known context: ~${Math.round(contextSize / 1000)}k tokens.\n\nUse /newchat to start fresh, then /respin to pull recent conversation back in.`,
+          );
+        } else {
+          await ctx.reply('Claude Code subprocess failed to start. Check logs or try /newchat.');
+        }
+      } else {
+        await ctx.reply('Something went wrong. Check the logs and try again.');
+      }
     }
   }
 }
@@ -682,41 +760,53 @@ export function createBot(): Bot {
 
     // Auto-commit session summary to hive mind (async, don't block the user)
     if (oldSessionId) {
-      const sessionToSummarize = oldSessionId;
       sessionBaseline.delete(oldSessionId);
 
-      // Fire-and-forget: ask the agent to produce a one-liner summary
-      (async () => {
+      if (FORCE_FRESH_SESSION) {
+        // In fresh session mode, don't resume the old session for a summary (expensive).
+        // Use a cheap deterministic summary from conversation_log instead.
         try {
-          const turns = getSessionConversation(sessionToSummarize, 40);
-          if (turns.length < 2) return;
-
-          const result = await runAgent(
-            'Summarize what we accomplished this session in ONE short sentence (under 100 chars). No preamble, no quotes, just the summary. Example: "Drafted LinkedIn post about AI agents and scheduled Gmail triage task"',
-            sessionToSummarize,
-            () => {},  // no typing indicator
-            undefined,
-            undefined,
-            undefined,
-          );
-
-          const summary = result.text?.trim();
-          if (summary && summary.length > 0) {
-            logToHiveMind(AGENT_ID, chatIdStr, 'session_end', summary.slice(0, 300));
-            logger.info({ agentId: AGENT_ID, summary }, 'Hive mind auto-commit (LLM summary)');
+          const turns = getSessionConversation(oldSessionId, 40);
+          if (turns.length >= 2) {
+            const firstUserMsg = turns.find(t => t.role === 'user')?.content?.slice(0, 100) || 'unknown';
+            logToHiveMind(AGENT_ID, chatIdStr, 'session_end', `${turns.length} turns starting with: ${firstUserMsg}`);
           }
-        } catch (err) {
-          // Fallback: log a basic summary from conversation turns
+        } catch { /* ignore */ }
+      } else {
+        // Legacy mode: use LLM to summarize (resumes session, costs cache_read)
+        const sessionToSummarize = oldSessionId;
+        (async () => {
           try {
             const turns = getSessionConversation(sessionToSummarize, 40);
-            if (turns.length >= 2) {
-              const firstUserMsg = turns.find(t => t.role === 'user')?.content?.slice(0, 100) || 'unknown';
-              logToHiveMind(AGENT_ID, chatIdStr, 'session_end', `${turns.length} turns starting with: ${firstUserMsg}`);
+            if (turns.length < 2) return;
+
+            const result = await runAgent(
+              'Summarize what we accomplished this session in ONE short sentence (under 100 chars). No preamble, no quotes, just the summary. Example: "Drafted LinkedIn post about AI agents and scheduled Gmail triage task"',
+              sessionToSummarize,
+              () => {},  // no typing indicator
+              undefined,
+              undefined,
+              undefined,
+            );
+
+            const summary = result.text?.trim();
+            if (summary && summary.length > 0) {
+              logToHiveMind(AGENT_ID, chatIdStr, 'session_end', summary.slice(0, 300));
+              logger.info({ agentId: AGENT_ID, summary }, 'Hive mind auto-commit (LLM summary)');
             }
-          } catch { /* give up */ }
-          logger.error({ err }, 'Hive mind LLM summary failed, used fallback');
-        }
-      })();
+          } catch (err) {
+            // Fallback: log a basic summary from conversation turns
+            try {
+              const turns = getSessionConversation(sessionToSummarize, 40);
+              if (turns.length >= 2) {
+                const firstUserMsg = turns.find(t => t.role === 'user')?.content?.slice(0, 100) || 'unknown';
+                logToHiveMind(AGENT_ID, chatIdStr, 'session_end', `${turns.length} turns starting with: ${firstUserMsg}`);
+              }
+            } catch { /* give up */ }
+            logger.error({ err }, 'Hive mind LLM summary failed, used fallback');
+          }
+        })();
+      }
     }
 
     clearSession(chatIdStr, AGENT_ID);
@@ -1276,23 +1366,32 @@ async function processDashboardMessage(
   setProcessing(chatIdStr, true);
 
   try {
-    const memCtx = await buildMemoryContext(chatIdStr, text);
+    // ── Mirror Telegram path: respect FORCE_FRESH_SESSION and SAFE_MODE ──
     const dashParts: string[] = [];
-    if (agentSystemPrompt) dashParts.push(`[Agent role — follow these instructions]\n${agentSystemPrompt}\n[End agent role]`);
-    if (memCtx) dashParts.push(memCtx);
 
-    const recentDashTasks = getRecentTaskOutputs(AGENT_ID, 30);
-    if (recentDashTasks.length > 0) {
-      const taskLines = recentDashTasks.map((t) => {
-        const ago = Math.round((Date.now() / 1000 - t.last_run) / 60);
-        return `[Scheduled task ran ${ago}m ago]\nTask: ${t.prompt}\nOutput:\n${t.last_result}`;
-      });
-      dashParts.push(`[Recent scheduled task context — the user may be replying to this]\n${taskLines.join('\n\n')}\n[End task context]`);
+    if (FORCE_FRESH_SESSION) {
+      const wmCtx = getWorkingMemoryContext(chatIdStr, AGENT_ID);
+      if (wmCtx) dashParts.push(wmCtx);
+    } else {
+      const memCtx = SAFE_MODE ? '' : await buildMemoryContext(chatIdStr, text);
+      if (agentSystemPrompt && !SAFE_MODE) dashParts.push(`[Agent role — follow these instructions]\n${agentSystemPrompt}\n[End agent role]`);
+      if (memCtx) dashParts.push(memCtx);
+
+      if (!SAFE_MODE) {
+        const recentDashTasks = getRecentTaskOutputs(AGENT_ID, 30);
+        if (recentDashTasks.length > 0) {
+          const taskLines = recentDashTasks.map((t) => {
+            const ago = Math.round((Date.now() / 1000 - t.last_run) / 60);
+            return `[Scheduled task ran ${ago}m ago]\nTask: ${t.prompt}\nOutput:\n${t.last_result}`;
+          });
+          dashParts.push(`[Recent scheduled task context — the user may be replying to this]\n${taskLines.join('\n\n')}\n[End task context]`);
+        }
+      }
     }
 
     dashParts.push(text);
     const fullMessage = dashParts.join('\n\n');
-    const sessionId = getSession(chatIdStr, AGENT_ID);
+    const sessionId = FORCE_FRESH_SESSION ? undefined : getSession(chatIdStr, AGENT_ID);
 
     const onProgress = (event: AgentProgressEvent) => {
       emitChatEvent({ type: 'progress', chatId: chatIdStr, description: event.description });
@@ -1312,7 +1411,6 @@ async function processDashboardMessage(
       onProgress,
       agentDefaultModel,
       abortCtrl,
-      agentMcpAllowlist,
     );
 
     clearTimeout(dashTimeout);
@@ -1327,7 +1425,7 @@ async function processDashboardMessage(
       return;
     }
 
-    if (result.newSessionId) {
+    if (!FORCE_FRESH_SESSION && result.newSessionId) {
       setSession(chatIdStr, result.newSessionId, AGENT_ID);
     }
 
@@ -1365,11 +1463,24 @@ async function processDashboardMessage(
       } catch (dbErr) {
         logger.error({ err: dbErr }, 'Failed to save token usage');
       }
+
+      // Cost alerts (send to Telegram)
+      await checkCostAlerts(
+        botApi,
+        chatIdStr,
+        result.usage.totalCostUsd,
+        result.usage.lastCallCacheRead,
+        !!sessionId,
+      );
     }
   } catch (err) {
     setActiveAbort(chatIdStr, null);
-    logger.error({ err }, 'Dashboard message processing error');
-    emitChatEvent({ type: 'error', chatId: chatIdStr, content: 'Something went wrong. Check the logs.' });
+    if (err instanceof DailyCostLimitError) {
+      emitChatEvent({ type: 'error', chatId: chatIdStr, content: err.userMessage });
+    } else {
+      logger.error({ err }, 'Dashboard message processing error');
+      emitChatEvent({ type: 'error', chatId: chatIdStr, content: 'Something went wrong. Check the logs.' });
+    }
   } finally {
     setProcessing(chatIdStr, false);
   }

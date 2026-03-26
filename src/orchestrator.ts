@@ -4,7 +4,7 @@ import path from 'path';
 
 import { runAgent, UsageInfo } from './agent.js';
 import { loadAgentConfig, listAgentIds, resolveAgentClaudeMd } from './agent-config.js';
-import { PROJECT_ROOT } from './config.js';
+import { PROJECT_ROOT, SAFE_MODE, SAFE_DISABLE_DELEGATION } from './config.js';
 import { logToHiveMind, createInterAgentTask, completeInterAgentTask } from './db.js';
 import { logger } from './logger.js';
 
@@ -132,6 +132,11 @@ export async function delegateToAgent(
   onProgress?: (msg: string) => void,
   timeoutMs = DEFAULT_TIMEOUT_MS,
 ): Promise<DelegationResult> {
+  // ── Safe Mode: block agent delegation to prevent cascading costs
+  if (SAFE_MODE && SAFE_DISABLE_DELEGATION) {
+    throw new Error(`[SAFE MODE] Agent delegation is disabled. Cannot delegate to "${agentId}".`);
+  }
+
   const agent = agentRegistry.find((a) => a.id === agentId);
   if (!agent) {
     const available = agentRegistry.map((a) => a.id).join(', ') || '(none)';
@@ -184,7 +189,6 @@ export async function delegateToAgent(
         undefined, // no progress callback for inner agent
         undefined, // use default model
         abortCtrl,
-        agentConfig.mcpServers,
       );
 
       clearTimeout(timer);
