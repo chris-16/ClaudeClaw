@@ -27,7 +27,7 @@ import { clearSession, getRecentConversation, getRecentMemories, getRecentTaskOu
 import { DailyCostLimitError } from './errors.js';
 import { logger } from './logger.js';
 import { downloadMedia, buildPhotoMessage, buildDocumentMessage, buildVideoMessage } from './media.js';
-import { buildMemoryContext, getWorkingMemoryContext, saveConversationTurn } from './memory.js';
+import { buildMemoryContext, evaluateMemoryRelevance, getWorkingMemoryContext, saveConversationTurn } from './memory.js';
 import { messageQueue } from './message-queue.js';
 import { parseDelegation, delegateToAgent, getAvailableAgents } from './orchestrator.js';
 import { emitChatEvent, setProcessing, setActiveAbort, abortActiveQuery } from './state.js';
@@ -414,6 +414,9 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
   // Build context to prepend to message
   const parts: string[] = [];
 
+  // Memory context result (hoisted for feedback loop after response)
+  let memResult = { contextText: '', surfacedMemoryIds: [] as number[], surfacedMemorySummaries: new Map<number, string>() };
+
   if (FORCE_FRESH_SESSION) {
     // Fresh session mode: use working memory instead of full memory context / system prompt
     // System prompt is loaded via settingSources (CLAUDE.md), so no need to inject it again
@@ -421,9 +424,9 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
     if (wmCtx) parts.push(wmCtx);
   } else {
     // Legacy mode: full memory context + system prompt injection
-    const memCtx = SAFE_MODE ? '' : await buildMemoryContext(chatIdStr, message);
+    memResult = SAFE_MODE ? memResult : await buildMemoryContext(chatIdStr, message, AGENT_ID);
     if (agentSystemPrompt && !SAFE_MODE) parts.push(`[Agent role — follow these instructions]\n${agentSystemPrompt}\n[End agent role]`);
-    if (memCtx) parts.push(memCtx);
+    if (memResult.contextText) parts.push(memResult.contextText);
 
     // Inject recent scheduled task outputs
     if (!SAFE_MODE) {
@@ -518,6 +521,8 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
     // Skip logging for synthetic messages like /respin to avoid self-referential growth.
     if (!skipLog) {
       saveConversationTurn(chatIdStr, message, rawResponse, result.newSessionId ?? sessionId, AGENT_ID);
+      // Fire-and-forget: evaluate which surfaced memories were actually useful
+      void evaluateMemoryRelevance(memResult.surfacedMemoryIds, memResult.surfacedMemorySummaries, message, rawResponse).catch(() => {});
     }
 
     // Emit assistant response to SSE clients
@@ -1369,13 +1374,16 @@ async function processDashboardMessage(
     // ── Mirror Telegram path: respect FORCE_FRESH_SESSION and SAFE_MODE ──
     const dashParts: string[] = [];
 
+    // Memory context result (hoisted for feedback loop after response)
+    let memResult2 = { contextText: '', surfacedMemoryIds: [] as number[], surfacedMemorySummaries: new Map<number, string>() };
+
     if (FORCE_FRESH_SESSION) {
       const wmCtx = getWorkingMemoryContext(chatIdStr, AGENT_ID);
       if (wmCtx) dashParts.push(wmCtx);
     } else {
-      const memCtx = SAFE_MODE ? '' : await buildMemoryContext(chatIdStr, text);
+      memResult2 = SAFE_MODE ? memResult2 : await buildMemoryContext(chatIdStr, text, AGENT_ID);
       if (agentSystemPrompt && !SAFE_MODE) dashParts.push(`[Agent role — follow these instructions]\n${agentSystemPrompt}\n[End agent role]`);
-      if (memCtx) dashParts.push(memCtx);
+      if (memResult2.contextText) dashParts.push(memResult2.contextText);
 
       if (!SAFE_MODE) {
         const recentDashTasks = getRecentTaskOutputs(AGENT_ID, 30);
@@ -1433,6 +1441,8 @@ async function processDashboardMessage(
 
     // Save conversation turn
     saveConversationTurn(chatIdStr, text, rawResponse, result.newSessionId ?? sessionId, AGENT_ID);
+    // Fire-and-forget: evaluate which surfaced memories were actually useful
+    void evaluateMemoryRelevance(memResult2.surfacedMemoryIds, memResult2.surfacedMemorySummaries, text, rawResponse).catch(() => {});
 
     // Emit assistant response to SSE clients
     emitChatEvent({ type: 'assistant_message', chatId: chatIdStr, content: rawResponse, source: 'dashboard' });

@@ -1,6 +1,9 @@
-import { agentObsidianConfig, GEMINI_MEMORY_ENABLED, GOOGLE_API_KEY, WORKING_MEMORY_MAX_CHARS } from './config.js';
+import { agentObsidianConfig, GOOGLE_API_KEY, WORKING_MEMORY_MAX_CHARS } from './config.js';
 import {
+  batchUpdateMemoryRelevance,
   decayMemories,
+  getConsolidationsWithEmbeddings,
+  getOtherAgentActivity,
   getRecentConsolidations,
   getRecentHighImportanceMemories,
   getWorkingMemory,
@@ -9,12 +12,12 @@ import {
   pruneSlackMessages,
   pruneWaMessages,
   searchConsolidations,
+  searchConversationHistory,
   searchMemories,
   setWorkingMemory,
-  touchMemory,
 } from './db.js';
-import { embedText } from './embeddings.js';
-import { generateContent } from './gemini.js';
+import { cosineSimilarity, embedText } from './embeddings.js';
+import { generateContent, parseJsonResponse } from './gemini.js';
 import { decayEntities } from './knowledge-graph.js';
 import { logger } from './logger.js';
 import { ingestConversationTurn } from './memory-ingest.js';
@@ -30,16 +33,24 @@ import { buildObsidianContext } from './obsidian.js';
  *
  * Deduplicates across layers. Returns formatted context with structure.
  */
+export interface MemoryContextResult {
+  contextText: string;
+  surfacedMemoryIds: number[];
+  surfacedMemorySummaries: Map<number, string>;
+}
+
 export async function buildMemoryContext(
   chatId: string,
   userMessage: string,
-): Promise<string> {
+  agentId = 'main',
+): Promise<MemoryContextResult> {
   const seen = new Set<number>();
+  const summaryMap = new Map<number, string>();
   const memLines: string[] = [];
 
   // Embed the query for vector search (async, adds ~200ms but gives semantic results)
   let queryEmbedding: number[] | undefined;
-  if (GEMINI_MEMORY_ENABLED && GOOGLE_API_KEY) {
+  if (GOOGLE_API_KEY) {
     try {
       queryEmbedding = await embedText(userMessage);
     } catch {
@@ -48,10 +59,13 @@ export async function buildMemoryContext(
   }
 
   // Layer 1: semantic search (embedding) with FTS5/LIKE fallback
+  // NOTE: We do NOT touch memories here. The feedback loop (evaluateMemoryRelevance)
+  // is the only thing that should boost salience/accessed_at. Touching at retrieval
+  // creates a positive feedback loop where noise stays fresh forever.
   const searched = searchMemories(chatId, userMessage, 5, queryEmbedding);
   for (const mem of searched) {
     seen.add(mem.id);
-    touchMemory(mem.id);
+    summaryMap.set(mem.id, mem.summary);
     const topics = safeParse(mem.topics);
     const topicStr = topics.length > 0 ? ` (${topics.join(', ')})` : '';
     memLines.push(`- [${mem.importance.toFixed(1)}] ${mem.summary}${topicStr}`);
@@ -62,29 +76,45 @@ export async function buildMemoryContext(
   for (const mem of recent) {
     if (seen.has(mem.id)) continue;
     seen.add(mem.id);
-    touchMemory(mem.id);
+    summaryMap.set(mem.id, mem.summary);
     const topics = safeParse(mem.topics);
     const topicStr = topics.length > 0 ? ` (${topics.join(', ')})` : '';
     memLines.push(`- [${mem.importance.toFixed(1)}] ${mem.summary}${topicStr}`);
   }
 
-  // Layer 3: consolidation insights
+  // Layer 3: consolidation insights (semantic search with LIKE fallback)
   const insightLines: string[] = [];
-  const consolidations = searchConsolidations(chatId, userMessage, 2);
-  if (consolidations.length === 0) {
-    // Fall back to most recent consolidations
-    const recentInsights = getRecentConsolidations(chatId, 2);
-    for (const c of recentInsights) {
-      insightLines.push(`- ${c.insight}`);
+
+  if (queryEmbedding && queryEmbedding.length > 0) {
+    const candidates = getConsolidationsWithEmbeddings(chatId);
+    if (candidates.length > 0) {
+      const scored = candidates
+        .map((c) => ({ ...c, score: cosineSimilarity(queryEmbedding, c.embedding) }))
+        .filter((s) => s.score > 0.3)
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 2);
+      for (const c of scored) {
+        insightLines.push(`- ${c.insight}`);
+      }
     }
-  } else {
-    for (const c of consolidations) {
-      insightLines.push(`- ${c.insight}`);
+  }
+
+  if (insightLines.length === 0) {
+    const consolidations = searchConsolidations(chatId, userMessage, 2);
+    if (consolidations.length === 0) {
+      const recentInsights = getRecentConsolidations(chatId, 2);
+      for (const c of recentInsights) {
+        insightLines.push(`- ${c.insight}`);
+      }
+    } else {
+      for (const c of consolidations) {
+        insightLines.push(`- ${c.insight}`);
+      }
     }
   }
 
   if (memLines.length === 0 && insightLines.length === 0 && !agentObsidianConfig) {
-    return '';
+    return { contextText: '', surfacedMemoryIds: [], surfacedMemorySummaries: new Map() };
   }
 
   const parts: string[] = [];
@@ -104,6 +134,34 @@ export async function buildMemoryContext(
     parts.push(blocks.join('\n'));
   }
 
+  // Layer 4: Cross-agent activity awareness
+  const teamActivity = getOtherAgentActivity(agentId, 24, 10);
+  if (teamActivity.length > 0) {
+    const activityLines = teamActivity.map((entry) => {
+      const ago = Math.round((Date.now() / 1000 - entry.created_at) / 60);
+      const timeStr = ago < 60 ? `${ago}m ago` : `${Math.round(ago / 60)}h ago`;
+      return `- [${entry.agent_id}] ${timeStr}: ${entry.summary}`;
+    });
+    parts.push(`[Team activity — what other agents have done recently]\n${activityLines.join('\n')}\n[End team activity]`);
+  }
+
+  // Layer 5: Conversation history recall
+  const recallKeywords = /\bremember\b|\brecall\b|\byesterday\b|\blast time\b|\bwe talked\b|\bwe discussed\b|\bwhat do you know\b|\bdo you know\b|\bwhat did we\b|\bpreviously\b|\bearlier\b|\blast week\b|\bfew days\b/i;
+  if (recallKeywords.test(userMessage)) {
+    const historyTurns = searchConversationHistory(chatId, userMessage, agentId, 7, 10);
+    if (historyTurns.length > 0) {
+      const historyLines = historyTurns
+        .reverse()
+        .map((t) => {
+          const daysAgo = Math.round((Date.now() / 1000 - t.created_at) / 86400);
+          const timeStr = daysAgo === 0 ? 'today' : daysAgo === 1 ? 'yesterday' : `${daysAgo}d ago`;
+          const role = t.role === 'user' ? 'User' : 'You';
+          return `[${timeStr}] ${role}: ${t.content.slice(0, 300)}`;
+        });
+      parts.push(`[Conversation history recall]\n${historyLines.join('\n')}\n[End conversation history]`);
+    }
+  }
+
   // Hint: the MCP memory server provides deeper knowledge graph access
   parts.push('[Memory tools available: use search_memory and open_nodes MCP tools to recall detailed information from your knowledge graph]');
 
@@ -113,7 +171,7 @@ export async function buildMemoryContext(
   const obsidianBlock = buildObsidianContext(agentObsidianConfig);
   if (obsidianBlock) parts.push(obsidianBlock);
 
-  return parts.join('\n\n');
+  return { contextText: parts.join('\n\n'), surfacedMemoryIds: [...seen], surfacedMemorySummaries: summaryMap };
 }
 
 /**
@@ -187,17 +245,15 @@ export function saveConversationTurn(
   }
 
   // Fire-and-forget: LLM-powered memory extraction via Gemini
-  // Only runs when GEMINI_MEMORY_ENABLED=true (disabled by default to save costs)
-  if (GEMINI_MEMORY_ENABLED) {
-    void ingestConversationTurn(chatId, userMessage, claudeResponse).catch((err) => {
-      logger.error({ err }, 'Memory ingestion fire-and-forget failed');
-    });
+  // This runs async and never blocks the user's response
+  void ingestConversationTurn(chatId, userMessage, claudeResponse, agentId).catch((err) => {
+    logger.error({ err }, 'Memory ingestion fire-and-forget failed');
+  });
 
-    // Fire-and-forget: update working memory summary via Gemini
-    void updateWorkingMemory(chatId, userMessage, claudeResponse, agentId).catch((err) => {
-      logger.warn({ err }, 'Working memory update fire-and-forget failed');
-    });
-  }
+  // Fire-and-forget: update working memory summary via Gemini
+  void updateWorkingMemory(chatId, userMessage, claudeResponse, agentId).catch((err) => {
+    logger.warn({ err }, 'Working memory update fire-and-forget failed');
+  });
 }
 
 /**
@@ -230,6 +286,44 @@ export function runDecaySweep(): void {
       { wa_messages: wa.messages, wa_outbox: wa.outbox, wa_map: wa.map, slack },
       'Retention pruning complete',
     );
+  }
+}
+
+/**
+ * After an agent response, evaluate which surfaced memories were useful.
+ * Fire-and-forget, never blocks the user. Has a 5-second timeout.
+ */
+export async function evaluateMemoryRelevance(
+  surfacedMemoryIds: number[],
+  memorySummaries: Map<number, string>,
+  userMessage: string,
+  assistantResponse: string,
+): Promise<void> {
+  if (surfacedMemoryIds.length === 0 || !GOOGLE_API_KEY) return;
+
+  try {
+    const memoryList = surfacedMemoryIds
+      .map((id) => `  ${id}: "${(memorySummaries.get(id) ?? '').slice(0, 100)}"`)
+      .join('\n');
+
+    const prompt = `Given this conversation, which memories were actually relevant and useful for the response? Return ONLY a JSON array of useful memory IDs. If none were useful, return [].
+
+User: ${userMessage.slice(0, 500)}
+Response: ${assistantResponse.slice(0, 500)}
+
+Memories that were surfaced:
+${memoryList}`;
+
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error('Evaluation timeout')), 5000),
+    );
+    const raw = await Promise.race([generateContent(prompt), timeoutPromise]);
+    const usefulIds = parseJsonResponse<number[]>(raw);
+    if (!usefulIds || !Array.isArray(usefulIds)) return;
+
+    batchUpdateMemoryRelevance(surfacedMemoryIds, new Set(usefulIds));
+  } catch {
+    // Non-fatal, never block
   }
 }
 
