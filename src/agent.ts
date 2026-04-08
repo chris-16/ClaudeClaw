@@ -1,8 +1,12 @@
 import { query } from '@anthropic-ai/claude-agent-sdk';
+import type { MessageParam } from '@anthropic-ai/sdk/resources';
 
 import { PROJECT_ROOT, agentCwd } from './config.js';
 import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
+
+/** Content that runAgent accepts: plain text or Anthropic multimodal content blocks. */
+export type AgentContent = MessageParam['content'];
 
 export interface UsageInfo {
   inputTokens: number;
@@ -71,15 +75,15 @@ export interface AgentResult {
  * The SDK drives the agentic loop internally (tool use, multi-step reasoning)
  * and surfaces a final `result` event when done.
  */
-async function* singleTurn(text: string): AsyncGenerator<{
+async function* singleTurn(content: AgentContent): AsyncGenerator<{
   type: 'user';
-  message: { role: 'user'; content: string };
+  message: { role: 'user'; content: AgentContent };
   parent_tool_use_id: null;
   session_id: string;
 }> {
   yield {
     type: 'user',
-    message: { role: 'user', content: text },
+    message: { role: 'user', content },
     parent_tool_use_id: null,
     session_id: '',
   };
@@ -102,7 +106,7 @@ async function* singleTurn(text: string): AsyncGenerator<{
  * @param onProgress Called when sub-agents start/complete — sends status updates to Telegram
  */
 export async function runAgent(
-  message: string,
+  message: AgentContent,
   sessionId: string | undefined,
   onTyping: () => void,
   onProgress?: (event: AgentProgressEvent) => void,
@@ -136,7 +140,7 @@ export async function runAgent(
 
   try {
     logger.info(
-      { sessionId: sessionId ?? 'new', messageLen: message.length },
+      { sessionId: sessionId ?? 'new', messageLen: typeof message === 'string' ? message.length : message.length },
       'Starting agent query',
     );
 

@@ -61,7 +61,7 @@ export async function ingestConversationTurn(
   assistantResponse: string,
 ): Promise<boolean> {
   // Hard filter: skip very short messages and commands
-  if (userMessage.length <= 15 || userMessage.startsWith('/')) return false;
+  if (userMessage.length <= 40 || userMessage.startsWith('/')) return false;
 
   try {
     const prompt = EXTRACTION_PROMPT

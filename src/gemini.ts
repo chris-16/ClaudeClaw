@@ -35,6 +35,33 @@ export async function generateContent(
 }
 
 /**
+ * Analyze a video using Gemini's native video understanding.
+ * Accepts base64-encoded video data and returns a text description.
+ */
+export async function analyzeVideo(
+  videoBase64: string,
+  mimeType: string,
+  prompt: string,
+  model = 'gemini-2.0-flash',
+): Promise<string> {
+  const ai = getClient();
+  const response = await ai.models.generateContent({
+    model,
+    contents: [
+      {
+        role: 'user',
+        parts: [
+          { inlineData: { data: videoBase64, mimeType } },
+          { text: prompt },
+        ],
+      },
+    ],
+    config: { temperature: 0.2 },
+  });
+  return response.text ?? '';
+}
+
+/**
  * Parse a JSON response from Gemini, with fallback on malformed output.
  * Returns null if parsing fails.
  */

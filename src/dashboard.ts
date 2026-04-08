@@ -32,6 +32,7 @@ import { processMessageFromDashboard } from './bot.js';
 import { getDashboardHtml } from './dashboard-html.js';
 import { logger } from './logger.js';
 import { getTelegramConnected, getBotInfo, chatEvents, getIsProcessing, abortActiveQuery, ChatEvent } from './state.js';
+import { glassesRoutes, compatRoutes } from './glasses.js';
 
 export function startDashboard(botApi?: Api<RawApi>): void {
   if (!DASHBOARD_TOKEN) {
@@ -45,7 +46,7 @@ export function startDashboard(botApi?: Api<RawApi>): void {
   app.use('*', async (c, next) => {
     c.header('Access-Control-Allow-Origin', '*');
     c.header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
-    c.header('Access-Control-Allow-Headers', 'Content-Type');
+    c.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Device-Id, x-openclaw-session-key');
     if (c.req.method === 'OPTIONS') return c.body(null, 204);
     await next();
   });
@@ -56,8 +57,16 @@ export function startDashboard(botApi?: Api<RawApi>): void {
     return c.json({ error: 'Internal server error' }, 500);
   });
 
-  // Token auth middleware
+  // ── Glasses & OpenAI-compat routes (Bearer auth, mounted before dashboard token auth) ──
+  app.route('/api/glasses', glassesRoutes);
+  app.route('/v1', compatRoutes);
+
+  // Token auth middleware (skip glasses/compat routes — they use Bearer auth)
   app.use('*', async (c, next) => {
+    const p = c.req.path;
+    if (p.startsWith('/v1/') || p.startsWith('/api/glasses/')) {
+      return next();
+    }
     const token = c.req.query('token');
     if (!DASHBOARD_TOKEN || !token || token !== DASHBOARD_TOKEN) {
       return c.json({ error: 'Unauthorized' }, 401);

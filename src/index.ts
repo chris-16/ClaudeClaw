@@ -140,8 +140,8 @@ async function main(): Promise<void> {
       void runConsolidation(ALLOWED_CHAT_ID).catch((err) =>
         logger.error({ err }, 'Periodic consolidation failed'),
       );
-    }, 30 * 60 * 1000);
-    logger.info('Memory consolidation enabled (every 30 min)');
+    }, 4 * 60 * 60 * 1000);
+    logger.info('Memory consolidation enabled (every 4 hours)');
   }
 
   cleanupOldUploads();
