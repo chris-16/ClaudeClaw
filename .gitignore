@@ -40,3 +40,8 @@ scripts/waste-reminder.sh
 CLAUDE.md
 agents/*/agent.yaml
 agents/*/CLAUDE.md
+
+# VPS-specific local files
+caldav-mcp/
+scripts/network-watchdog-linux.sh
+scripts/start-caldav-mcp.sh
