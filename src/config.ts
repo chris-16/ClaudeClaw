@@ -19,6 +19,10 @@ const envConfig = readEnvFile([
   'CLAUDECLAW_CONFIG',
   'DB_ENCRYPTION_KEY',
   'GOOGLE_API_KEY',
+  'AGENT_TIMEOUT_MS',
+  'SECURITY_PIN_HASH',
+  'IDLE_LOCK_MINUTES',
+  'EMERGENCY_KILL_PHRASE',
 ]);
 
 // ── Multi-agent support ──────────────────────────────────────────────
@@ -30,6 +34,7 @@ export let agentCwd: string | undefined; // undefined = use PROJECT_ROOT
 export let agentDefaultModel: string | undefined; // from agent.yaml
 export let agentObsidianConfig: { vault: string; folders: string[]; readOnly?: string[] } | undefined;
 export let agentSystemPrompt: string | undefined; // loaded from agents/{id}/CLAUDE.md
+export let agentMcpAllowlist: string[] | undefined; // from agent.yaml mcp_servers
 
 export function setAgentOverrides(opts: {
   agentId: string;
@@ -38,6 +43,7 @@ export function setAgentOverrides(opts: {
   model?: string;
   obsidian?: { vault: string; folders: string[]; readOnly?: string[] };
   systemPrompt?: string;
+  mcpServers?: string[];
 }): void {
   AGENT_ID = opts.agentId;
   activeBotToken = opts.botToken;
@@ -45,6 +51,7 @@ export function setAgentOverrides(opts: {
   agentDefaultModel = opts.model;
   agentObsidianConfig = opts.obsidian;
   agentSystemPrompt = opts.systemPrompt;
+  agentMcpAllowlist = opts.mcpServers;
 }
 
 export const TELEGRAM_BOT_TOKEN =
@@ -104,10 +111,12 @@ export const MAX_MESSAGE_LENGTH = 4096;
 export const TYPING_REFRESH_MS = 4000;
 
 // Maximum time (ms) an agent query can run before being auto-aborted.
-// Prevents runaway commands (e.g. recursive `find /`) from blocking the bot indefinitely.
-// Default: 5 minutes. Override via AGENT_TIMEOUT_MS in .env.
+// Safety net for truly stuck commands (e.g. recursive `find /`).
+// Default: 15 minutes. Use /stop in Telegram to manually kill a running query.
+// Previously 5 min, which caused mid-execution timeouts on bulk API work
+// (posting YouTube comments, sending multiple messages) leading to duplicate posts.
 export const AGENT_TIMEOUT_MS = parseInt(
-  process.env.AGENT_TIMEOUT_MS || envConfig.AGENT_TIMEOUT_MS || '300000',
+  process.env.AGENT_TIMEOUT_MS || envConfig.AGENT_TIMEOUT_MS || '900000',
   10,
 );
 
@@ -135,3 +144,28 @@ export const DB_ENCRYPTION_KEY =
 // Google API key for Gemini (memory extraction + consolidation)
 export const GOOGLE_API_KEY =
   process.env.GOOGLE_API_KEY || envConfig.GOOGLE_API_KEY || '';
+
+// Streaming strategy for progressive Telegram updates.
+// 'global-throttle' (default): edits a placeholder message with streamed text,
+//   rate-limited to ~24 edits/min per chat to respect Telegram limits.
+// 'single-agent-only': streaming disabled when multiple agents are active on same chat.
+// 'off': no streaming, wait for full response.
+export type StreamStrategy = 'global-throttle' | 'single-agent-only' | 'off';
+export const STREAM_STRATEGY: StreamStrategy =
+  (process.env.STREAM_STRATEGY || 'off') as StreamStrategy;
+
+// ── Security ─────────────────────────────────────────────────────────
+// PIN lock: SHA-256 hash of your PIN. Generate: node -e "console.log(require('crypto').createHash('sha256').update('YOUR_PIN').digest('hex'))"
+export const SECURITY_PIN_HASH =
+  process.env.SECURITY_PIN_HASH || envConfig.SECURITY_PIN_HASH || '';
+
+// Auto-lock after N minutes of inactivity. 0 = disabled. Only active when PIN is set.
+export const IDLE_LOCK_MINUTES = parseInt(
+  process.env.IDLE_LOCK_MINUTES || envConfig.IDLE_LOCK_MINUTES || '0',
+  10,
+);
+
+// Emergency kill phrase. Sending this to any bot immediately stops all agents and exits.
+export const EMERGENCY_KILL_PHRASE =
+  process.env.EMERGENCY_KILL_PHRASE || envConfig.EMERGENCY_KILL_PHRASE || '';
+

@@ -1,0 +1,41 @@
+
+ ██████╗██╗      █████╗ ██╗   ██╗██████╗ ███████╗
+██╔════╝██║     ██╔══██╗██║   ██║██╔══██╗██╔════╝
+██║     ██║     ███████║██║   ██║██║  ██║█████╗
+██║     ██║     ██╔══██║██║   ██║██║  ██║██╔══╝
+╚██████╗███████╗██║  ██║╚██████╔╝██████╔╝███████╗
+ ╚═════╝╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝╚══════╝
+
+ ██████╗██╗      █████╗ ██╗    ██╗
+██╔════╝██║     ██╔══██╗██║    ██║
+██║     ██║     ███████║██║ █╗ ██║
+██║     ██║     ██╔══██║██║███╗██║
+╚██████╗███████╗██║  ██║╚███╔███╔╝
+ ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝
+
+(node:439632) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+  ClaudeClaw online: @chriscl_claw_bot
+
+[18:15:04.828] [32mINFO[39m (439632): [36mLoaded CLAUDE.md from CLAUDECLAW_CONFIG[39m
+    [35msource[39m: "/home/chris/.claudeclaw/CLAUDE.md"
+[18:15:04.834] [32mINFO[39m (439632): [36mDatabase ready[39m
+[18:15:04.837] [32mINFO[39m (439632): [36mOrchestrator initialized[39m
+    [35magents[39m: [
+      "axiom",
+      "director",
+      "dratlas"
+    ]
+[18:15:04.870] [32mINFO[39m (439632): [36mMemory consolidation enabled (every 30 min)[39m
+[18:15:04.889] [32mINFO[39m (439632): [36mScheduler started (checking every 60s)[39m
+    [35magentId[39m: "main"
+[18:15:04.889] [32mINFO[39m (439632): [36mStarting ClaudeClaw...[39m
+    [35magentId[39m: "main"
+[18:15:04.894] [32mINFO[39m (439632): [36mDashboard server running[39m
+    [35mport[39m: 3141
+[18:15:04.953] [32mINFO[39m (439632): [36mClaudeClaw is running[39m
+    [35musername[39m: "chriscl_claw_bot"
+[18:15:05.088] [32mINFO[39m (439632): [36mRegistered 0 skill commands with Telegram[39m
+    [35mcount[39m: 0
+[18:15:18.569] [32mINFO[39m (439632): [36mShutting down...[39m
