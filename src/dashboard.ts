@@ -666,12 +666,12 @@ export function startDashboard(botApi?: Api<RawApi>): void {
   // Send message from dashboard
   app.post('/api/chat/send', async (c) => {
     if (!botApi) return c.json({ error: 'Bot API not available' }, 503);
-    const body = await c.req.json<{ message?: string }>();
+    const body = await c.req.json<{ message?: string; skipTelegram?: boolean }>();
     const message = body?.message?.trim();
     if (!message) return c.json({ error: 'message required' }, 400);
 
     // Fire-and-forget: response comes via SSE
-    void processMessageFromDashboard(botApi, message);
+    void processMessageFromDashboard(botApi, message, body?.skipTelegram ?? false);
     return c.json({ ok: true });
   });
 

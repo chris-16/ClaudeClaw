@@ -1578,22 +1578,24 @@ export function createBot(): Bot {
 export async function processMessageFromDashboard(
   botApi: Api<RawApi>,
   text: string,
+  skipTelegram = false,
 ): Promise<void> {
   if (!ALLOWED_CHAT_ID) return;
 
   const chatIdStr = ALLOWED_CHAT_ID;
 
-  logger.info({ messageLen: text.length, source: 'dashboard' }, 'Processing dashboard message');
+  logger.info({ messageLen: text.length, source: 'dashboard', skipTelegram }, 'Processing dashboard message');
 
   // Route through the message queue so dashboard messages wait for any
   // in-flight Telegram message or scheduled task to finish first.
-  messageQueue.enqueue(chatIdStr, () => processDashboardMessage(botApi, text, chatIdStr));
+  messageQueue.enqueue(chatIdStr, () => processDashboardMessage(botApi, text, chatIdStr, skipTelegram));
 }
 
 async function processDashboardMessage(
   botApi: Api<RawApi>,
   text: string,
   chatIdStr: string,
+  skipTelegram = false,
 ): Promise<void> {
   emitChatEvent({ type: 'user_message', chatId: chatIdStr, content: text, source: 'dashboard' });
   setProcessing(chatIdStr, true);
@@ -1667,11 +1669,13 @@ async function processDashboardMessage(
     // Emit assistant response to SSE clients
     emitChatEvent({ type: 'assistant_message', chatId: chatIdStr, content: rawResponse, source: 'dashboard' });
 
-    // Relay to Telegram so the user sees it there too
-    const { text: responseText } = extractFileMarkers(rawResponse);
-    if (responseText) {
-      for (const part of splitMessage(formatForTelegram(responseText))) {
-        await botApi.sendMessage(parseInt(chatIdStr), part, { parse_mode: 'HTML' });
+    // Relay to Telegram (skip when message came from War Room to avoid duplicates)
+    if (!skipTelegram) {
+      const { text: responseText } = extractFileMarkers(rawResponse);
+      if (responseText) {
+        for (const part of splitMessage(formatForTelegram(responseText))) {
+          await botApi.sendMessage(parseInt(chatIdStr), part, { parse_mode: 'HTML' });
+        }
       }
     }
 
