@@ -19,11 +19,16 @@ import {
   TYPING_REFRESH_MS,
   AGENT_TIMEOUT_MS,
   STREAM_STRATEGY,
+  DAILY_BUDGET_USD,
+  MONTHLY_BUDGET_USD,
+  SMART_ROUTING,
 } from './config.js';
-import { clearSession, getRecentConversation, getRecentMemories, getRecentTaskOutputs, getSession, getSessionConversation, logToHiveMind, pinMemory, unpinMemory, setSession, lookupWaChatId, saveWaMessageMap, saveTokenUsage } from './db.js';
+import { clearSession, getRecentConversation, getRecentMemories, getRecentTaskOutputs, getSession, getSessionConversation, logToHiveMind, pinMemory, unpinMemory, setSession, lookupWaChatId, saveWaMessageMap, saveTokenUsage, getDailyCostAll, getMonthlyCostAll, turnsSinceLastMemory } from './db.js';
 import { logger } from './logger.js';
 import { downloadMedia, buildPhotoMessage, buildDocumentMessage, buildVideoMessage } from './media.js';
 import { buildMemoryContext, evaluateMemoryRelevance, saveConversationTurn } from './memory.js';
+import { routeMessage, applyBudgetOverride, type RoutingDecision } from './model-router.js';
+import { redactSensitiveValues } from './exfil-guard.js';
 import { setHighImportanceCallback } from './memory-ingest.js';
 import { messageQueue } from './message-queue.js';
 import { parseDelegation, delegateToAgent, getAvailableAgents } from './orchestrator.js';
@@ -91,6 +96,60 @@ function checkContextWarning(chatId: string, sessionId: string | undefined, usag
 
   return null;
 }
+
+// ── Budget tracking ─────────────────────────────────────────────────
+// Cached per-minute to avoid hitting SQLite on every turn
+let budgetCache: { dailyPct: number; monthlyPct: number; ts: number } | null = null;
+const BUDGET_CACHE_TTL_MS = 60_000;
+
+function getBudgetPct(): number {
+  if (DAILY_BUDGET_USD <= 0 && MONTHLY_BUDGET_USD <= 0) return 0;
+
+  const now = Date.now();
+  if (budgetCache && now - budgetCache.ts < BUDGET_CACHE_TTL_MS) {
+    return Math.max(budgetCache.dailyPct, budgetCache.monthlyPct);
+  }
+
+  const dailyPct = DAILY_BUDGET_USD > 0
+    ? Math.round((getDailyCostAll() / DAILY_BUDGET_USD) * 100)
+    : 0;
+  const monthlyPct = MONTHLY_BUDGET_USD > 0
+    ? Math.round((getMonthlyCostAll() / MONTHLY_BUDGET_USD) * 100)
+    : 0;
+
+  budgetCache = { dailyPct, monthlyPct, ts: now };
+  return Math.max(dailyPct, monthlyPct);
+}
+
+function checkBudgetWarning(): string | null {
+  if (DAILY_BUDGET_USD <= 0 && MONTHLY_BUDGET_USD <= 0) return null;
+
+  // Force a fresh read
+  budgetCache = null;
+  const dailyPct = DAILY_BUDGET_USD > 0
+    ? Math.round((getDailyCostAll() / DAILY_BUDGET_USD) * 100)
+    : 0;
+  const monthlyPct = MONTHLY_BUDGET_USD > 0
+    ? Math.round((getMonthlyCostAll() / MONTHLY_BUDGET_USD) * 100)
+    : 0;
+
+  budgetCache = { dailyPct, monthlyPct, ts: Date.now() };
+
+  const warnings: string[] = [];
+  if (dailyPct >= 95) {
+    warnings.push(`Daily budget at ${dailyPct}% ($${getDailyCostAll().toFixed(2)}/$${DAILY_BUDGET_USD}). Auto-routing to Haiku.`);
+  } else if (dailyPct >= 80) {
+    warnings.push(`Daily budget at ${dailyPct}% ($${getDailyCostAll().toFixed(2)}/$${DAILY_BUDGET_USD}).`);
+  }
+  if (monthlyPct >= 95) {
+    warnings.push(`Monthly budget at ${monthlyPct}% ($${getMonthlyCostAll().toFixed(2)}/$${MONTHLY_BUDGET_USD}). Auto-routing to Haiku.`);
+  } else if (monthlyPct >= 80) {
+    warnings.push(`Monthly budget at ${monthlyPct}% ($${getMonthlyCostAll().toFixed(2)}/$${MONTHLY_BUDGET_USD}).`);
+  }
+
+  return warnings.length > 0 ? `💰 ${warnings.join(' ')}` : null;
+}
+
 import {
   downloadTelegramFile,
   transcribeAudio,
@@ -451,8 +510,33 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
     parts.push(`[Recent scheduled task context — the user may be replying to this]\n${taskLines.join('\n\n')}\n[End task context]`);
   }
 
+  // Memory nudge: if many turns passed without saving a memory, remind the agent
+  const turnsSinceMem = turnsSinceLastMemory(chatIdStr, AGENT_ID);
+  if (turnsSinceMem >= 20) {
+    parts.push(`[Memory nudge — ${turnsSinceMem} turns since last memory save]\nIf anything worth remembering came up recently, consider saving it to memory.\n[End memory nudge]`);
+  }
+
   parts.push(message);
   const fullMessage = parts.join('\n\n');
+
+  // Smart model routing: pick the cheapest model that can handle this message.
+  // Manual /model override takes precedence. Budget override can force Haiku.
+  let routedModel: string | undefined;
+  let routingDecision: RoutingDecision | undefined;
+  const manualOverride = chatModelOverride.get(chatIdStr) ?? agentDefaultModel;
+
+  if (SMART_ROUTING && !manualOverride) {
+    routingDecision = routeMessage(message);
+
+    // Budget check: if daily/monthly spend is high, potentially downgrade
+    const budgetPct = getBudgetPct();
+    if (budgetPct > 0) {
+      routingDecision = applyBudgetOverride(routingDecision, budgetPct);
+    }
+
+    routedModel = routingDecision.modelId;
+    logger.info({ tier: routingDecision.tier, reason: routingDecision.reason, model: routedModel }, 'Smart routing');
+  }
 
   // Start typing immediately, then refresh on interval
   await sendTyping(ctx.api, chatId);
@@ -536,7 +620,7 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
       sessionId,
       () => void sendTyping(ctx.api, chatId),
       onProgress,
-      chatModelOverride.get(chatIdStr) ?? agentDefaultModel,
+      manualOverride ?? routedModel,
       abortCtrl,
       onStreamText,
       agentMcpAllowlist,
@@ -567,7 +651,7 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
       logger.info({ newSessionId: result.newSessionId }, 'Session saved');
     }
 
-    const rawResponse = result.text?.trim() || 'Done.';
+    const rawResponse = redactSensitiveValues(result.text?.trim() || 'Done.');
 
     // Extract file markers before any formatting
     const { text: responseText, files: fileMarkers } = extractFileMarkers(rawResponse);
@@ -628,7 +712,7 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
       }
     }
 
-    // Log token usage to SQLite and check for context warnings
+    // Log token usage to SQLite and check for context + budget warnings
     if (result.usage) {
       const activeSessionId = result.newSessionId ?? sessionId;
       try {
@@ -642,12 +726,19 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
           result.usage.totalCostUsd,
           result.usage.didCompact,
           AGENT_ID,
+          routingDecision ? `${routingDecision.tier}:${routingDecision.reason}` : undefined,
         );
       } catch (dbErr) {
         logger.error({ err: dbErr }, 'Failed to save token usage');
       }
 
       const warning = checkContextWarning(chatIdStr, activeSessionId, result.usage);
+
+      // Budget warnings (after context warning so both can fire)
+      const budgetWarning = checkBudgetWarning();
+      if (budgetWarning) {
+        await ctx.reply(budgetWarning);
+      }
       if (warning) {
         await ctx.reply(warning);
       }
@@ -1565,7 +1656,7 @@ async function processDashboardMessage(
       setSession(chatIdStr, result.newSessionId, AGENT_ID);
     }
 
-    const rawResponse = result.text?.trim() || 'Done.';
+    const rawResponse = redactSensitiveValues(result.text?.trim() || 'Done.');
 
     // Save conversation turn
     saveConversationTurn(chatIdStr, text, rawResponse, result.newSessionId ?? sessionId, AGENT_ID);

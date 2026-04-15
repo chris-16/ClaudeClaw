@@ -215,22 +215,65 @@ async function main(): Promise<void> {
 
   logger.info({ agentId: AGENT_ID }, 'Starting ClaudeClaw...');
 
-  await bot.start({
-    onStart: (botInfo) => {
-      setTelegramConnected(true);
-      setBotInfo(botInfo.username ?? '', botInfo.first_name ?? 'ClaudeClaw');
-      logger.info({ username: botInfo.username }, 'ClaudeClaw is running');
-      if (AGENT_ID === 'main') {
-        console.log(`\n  ClaudeClaw online: @${botInfo.username}`);
-        if (!ALLOWED_CHAT_ID) {
-          console.log(`  Send /chatid to get your chat ID for ALLOWED_CHAT_ID`);
-        }
-        console.log();
-      } else {
-        console.log(`\n  ClaudeClaw agent [${AGENT_ID}] online: @${botInfo.username}\n`);
+  // Flush any stale Telegram long-polls before starting Grammy.
+  // After a crash loop, Telegram's servers may still hold an open getUpdates
+  // connection for up to 30s, causing 409 conflicts for the new instance.
+  const MAX_POLL_RETRIES = 5;
+  for (let attempt = 1; attempt <= MAX_POLL_RETRIES; attempt++) {
+    try {
+      const flushRes = await fetch(
+        `https://api.telegram.org/bot${activeBotToken}/getUpdates?timeout=0&offset=-1`,
+      );
+      const flushData = (await flushRes.json()) as { ok: boolean };
+      if (flushData.ok) break;
+    } catch {
+      // Network hiccup, keep trying
+    }
+    if (attempt < MAX_POLL_RETRIES) {
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+  }
+
+  const startBot = async (retries = 3): Promise<void> => {
+    try {
+      await bot.start({
+        onStart: (botInfo) => {
+          setTelegramConnected(true);
+          setBotInfo(botInfo.username ?? '', botInfo.first_name ?? 'ClaudeClaw');
+          logger.info({ username: botInfo.username }, 'ClaudeClaw is running');
+          if (AGENT_ID === 'main') {
+            console.log(`\n  ClaudeClaw online: @${botInfo.username}`);
+            if (!ALLOWED_CHAT_ID) {
+              console.log(`  Send /chatid to get your chat ID for ALLOWED_CHAT_ID`);
+            }
+            console.log();
+          } else {
+            console.log(`\n  ClaudeClaw agent [${AGENT_ID}] online: @${botInfo.username}\n`);
+          }
+        },
+      });
+    } catch (err: unknown) {
+      const is409 =
+        err instanceof Error &&
+        'error_code' in err &&
+        (err as { error_code: number }).error_code === 409;
+      if (is409 && retries > 0) {
+        logger.warn(
+          { retriesLeft: retries },
+          'Telegram 409 conflict — flushing stale poll and retrying...',
+        );
+        // Flush the stale poll
+        await fetch(
+          `https://api.telegram.org/bot${activeBotToken}/getUpdates?timeout=0&offset=-1`,
+        ).catch(() => {});
+        await new Promise((r) => setTimeout(r, 3000));
+        return startBot(retries - 1);
       }
-    },
-  });
+      throw err;
+    }
+  };
+
+  await startBot();
 }
 
 main().catch((err: unknown) => {

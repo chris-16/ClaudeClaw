@@ -23,6 +23,9 @@ const envConfig = readEnvFile([
   'SECURITY_PIN_HASH',
   'IDLE_LOCK_MINUTES',
   'EMERGENCY_KILL_PHRASE',
+  'DAILY_BUDGET_USD',
+  'MONTHLY_BUDGET_USD',
+  'SMART_ROUTING',
 ]);
 
 // ── Multi-agent support ──────────────────────────────────────────────
@@ -168,4 +171,17 @@ export const IDLE_LOCK_MINUTES = parseInt(
 // Emergency kill phrase. Sending this to any bot immediately stops all agents and exits.
 export const EMERGENCY_KILL_PHRASE =
   process.env.EMERGENCY_KILL_PHRASE || envConfig.EMERGENCY_KILL_PHRASE || '';
+
+// Budget limits. Set to 0 to disable. Warnings at 80%, forced Haiku at 95%.
+export const DAILY_BUDGET_USD = parseFloat(
+  process.env.DAILY_BUDGET_USD || envConfig.DAILY_BUDGET_USD || '0',
+);
+export const MONTHLY_BUDGET_USD = parseFloat(
+  process.env.MONTHLY_BUDGET_USD || envConfig.MONTHLY_BUDGET_USD || '0',
+);
+
+// Smart model routing. Set to 'true' to auto-select model per message complexity.
+// Manual /model overrides still take precedence.
+export const SMART_ROUTING =
+  (process.env.SMART_ROUTING || envConfig.SMART_ROUTING || 'true').toLowerCase() === 'true';
 

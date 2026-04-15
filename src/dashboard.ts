@@ -40,6 +40,9 @@ import {
   getAuditLog,
   getAuditLogCount,
   getRecentBlockedActions,
+  getCostByAgent,
+  getDailyCostAll,
+  getMonthlyCostAll,
 } from './db.js';
 import { generateContent, parseJsonResponse } from './gemini.js';
 import { getSecurityStatus } from './security.js';
@@ -427,6 +430,15 @@ export function startDashboard(botApi?: Api<RawApi>): void {
     const agentId = c.req.param('id');
     const stats = getAgentTokenStats(agentId);
     return c.json(stats);
+  });
+
+  // Cross-agent cost breakdown (rate tracker)
+  app.get('/api/stats/by-agent', (c) => {
+    const days = parseInt(c.req.query('days') || '7', 10);
+    const byAgent = getCostByAgent(days);
+    const dailyTotal = getDailyCostAll();
+    const monthlyTotal = getMonthlyCostAll();
+    return c.json({ byAgent, dailyTotal, monthlyTotal, period: `${days}d` });
   });
 
   // Update agent model

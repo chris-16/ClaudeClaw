@@ -527,6 +527,13 @@ function runMigrations(database: Database.Database): void {
     `);
     logger.info('Migration: made mission_tasks.assigned_agent nullable');
   }
+
+  // Smart routing: track which model was auto-selected per turn
+  const usageColsRouted = database.prepare(`PRAGMA table_info(token_usage)`).all() as Array<{ name: string }>;
+  if (!usageColsRouted.some((c) => c.name === 'routed_model')) {
+    database.exec(`ALTER TABLE token_usage ADD COLUMN routed_model TEXT`);
+    logger.info('Migration: added routed_model column to token_usage');
+  }
 }
 
 /** @internal - for tests only. Creates a fresh in-memory database. */
@@ -1335,12 +1342,13 @@ export function saveTokenUsage(
   costUsd: number,
   didCompact: boolean,
   agentId = 'main',
+  routedModel?: string,
 ): void {
   const now = Math.floor(Date.now() / 1000);
   db.prepare(
-    `INSERT INTO token_usage (chat_id, session_id, input_tokens, output_tokens, cache_read, context_tokens, cost_usd, did_compact, created_at, agent_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(chatId, sessionId ?? null, inputTokens, outputTokens, cacheRead, contextTokens, costUsd, didCompact ? 1 : 0, now, agentId);
+    `INSERT INTO token_usage (chat_id, session_id, input_tokens, output_tokens, cache_read, context_tokens, cost_usd, did_compact, created_at, agent_id, routed_model)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(chatId, sessionId ?? null, inputTokens, outputTokens, cacheRead, contextTokens, costUsd, didCompact ? 1 : 0, now, agentId, routedModel ?? null);
 }
 
 export interface SessionTokenSummary {
@@ -1635,6 +1643,85 @@ export function getAgentTokenStats(agentId: string): { todayCost: number; todayT
     .get(agentId) as { allTimeCost: number };
 
   return { ...today, allTimeCost: allTime.allTimeCost };
+}
+
+/** Total cost across all agents for the current calendar day (UTC). */
+export function getDailyCostAll(): number {
+  const row = db
+    .prepare(
+      `SELECT COALESCE(SUM(cost_usd), 0) as cost
+       FROM token_usage
+       WHERE created_at >= unixepoch('now', 'start of day')`,
+    )
+    .get() as { cost: number };
+  return row.cost;
+}
+
+/** Total cost across all agents for the current calendar month (UTC). */
+export function getMonthlyCostAll(): number {
+  const row = db
+    .prepare(
+      `SELECT COALESCE(SUM(cost_usd), 0) as cost
+       FROM token_usage
+       WHERE created_at >= unixepoch('now', 'start of month')`,
+    )
+    .get() as { cost: number };
+  return row.cost;
+}
+
+/** Cost and token stats grouped by agent for the last N days. */
+export function getCostByAgent(days: number): Array<{
+  agent_id: string;
+  total_cost: number;
+  total_input: number;
+  total_output: number;
+  turns: number;
+}> {
+  return db
+    .prepare(
+      `SELECT agent_id,
+              COALESCE(SUM(cost_usd), 0)      as total_cost,
+              COALESCE(SUM(input_tokens), 0)   as total_input,
+              COALESCE(SUM(output_tokens), 0)  as total_output,
+              COUNT(*)                          as turns
+       FROM token_usage
+       WHERE created_at >= unixepoch('now', '-' || ? || ' days')
+       GROUP BY agent_id
+       ORDER BY total_cost DESC`,
+    )
+    .all(days) as Array<{
+      agent_id: string;
+      total_cost: number;
+      total_input: number;
+      total_output: number;
+      turns: number;
+    }>;
+}
+
+/** Count of turns since the last memory was saved for a given chat+agent. */
+export function turnsSinceLastMemory(chatId: string, agentId: string): number {
+  const lastMemory = db
+    .prepare(
+      `SELECT MAX(created_at) as last_at FROM memories
+       WHERE chat_id = ? AND agent_id = ?`,
+    )
+    .get(chatId, agentId) as { last_at: number | null };
+
+  if (!lastMemory.last_at) {
+    // No memories at all - count all turns
+    const row = db
+      .prepare(`SELECT COUNT(*) as cnt FROM conversation_log WHERE chat_id = ? AND agent_id = ?`)
+      .get(chatId, agentId) as { cnt: number };
+    return row.cnt;
+  }
+
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) as cnt FROM conversation_log
+       WHERE chat_id = ? AND agent_id = ? AND created_at > ?`,
+    )
+    .get(chatId, agentId, lastMemory.last_at) as { cnt: number };
+  return row.cnt;
 }
 
 export function getAgentRecentConversation(agentId: string, chatId: string, limit = 4): ConversationTurn[] {

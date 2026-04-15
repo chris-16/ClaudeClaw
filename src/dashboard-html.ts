@@ -489,6 +489,29 @@ export function getDashboardHtml(token: string, chatId: string): string {
     <div class="text-xs text-gray-400 mb-2">Usage Timeline (30d)<span class="info-tip"><span class="info-icon">\u24D8</span><span class="info-tooltip">Daily token usage over the last 30 days.</span></span></div>
     <canvas id="cost-chart" height="140"></canvas>
   </div>
+  <div class="card" id="rate-tracker-card">
+    <div class="flex items-center justify-between mb-2">
+      <div class="text-xs text-gray-400">Cost by Agent<span class="info-tip"><span class="info-icon">\u24D8</span><span class="info-tooltip">Token spend breakdown per agent. Toggle between 7d and 30d.</span></span></div>
+      <div class="flex gap-1">
+        <button onclick="loadRateTracker(7)" id="rt-7d" class="text-xs px-2 py-0.5 rounded bg-purple-900/50 text-purple-300 border border-purple-800" style="font-size:10px">7d</button>
+        <button onclick="loadRateTracker(30)" id="rt-30d" class="text-xs px-2 py-0.5 rounded bg-gray-800 text-gray-500 border border-gray-700" style="font-size:10px">30d</button>
+      </div>
+    </div>
+    <div class="flex items-center gap-3 mb-2">
+      <div class="text-xs text-gray-500">Today: <span id="rt-daily" class="text-green-400">-</span></div>
+      <div class="text-xs text-gray-500">Month: <span id="rt-monthly" class="text-blue-400">-</span></div>
+    </div>
+    <table style="width:100%;font-size:11px;border-collapse:collapse" id="rt-table">
+      <thead><tr style="color:#6b7280;border-bottom:1px solid #1f1f1f">
+        <th style="text-align:left;padding:2px 4px">Agent</th>
+        <th style="text-align:right;padding:2px 4px">Cost</th>
+        <th style="text-align:right;padding:2px 4px">Turns</th>
+        <th style="text-align:right;padding:2px 4px">In</th>
+        <th style="text-align:right;padding:2px 4px">Out</th>
+      </tr></thead>
+      <tbody id="rt-body"><tr><td colspan="5" class="text-gray-600" style="padding:8px;text-align:center">Loading...</td></tr></tbody>
+    </table>
+  </div>
 
 </div>
 
@@ -951,6 +974,49 @@ document.addEventListener('click', function(e) {
   }
   document.querySelectorAll('.info-tip.active').forEach(t => t.classList.remove('active'));
 }, true);
+
+// ── Rate Tracker ────────────────────────────────────────────────────
+let rtActiveDays = 7;
+async function loadRateTracker(days) {
+  rtActiveDays = days || 7;
+  try {
+    const data = await api('/api/stats/by-agent?days=' + rtActiveDays);
+    // Update totals
+    document.getElementById('rt-daily').textContent = '$' + (data.dailyTotal || 0).toFixed(2);
+    document.getElementById('rt-monthly').textContent = '$' + (data.monthlyTotal || 0).toFixed(2);
+    // Toggle button styles
+    var btn7 = document.getElementById('rt-7d');
+    var btn30 = document.getElementById('rt-30d');
+    if (days === 7) {
+      btn7.style.background = 'rgba(88,28,135,0.5)'; btn7.style.color = '#c4b5fd'; btn7.style.borderColor = '#6b21a8';
+      btn30.style.background = '#1f2937'; btn30.style.color = '#6b7280'; btn30.style.borderColor = '#374151';
+    } else {
+      btn30.style.background = 'rgba(88,28,135,0.5)'; btn30.style.color = '#c4b5fd'; btn30.style.borderColor = '#6b21a8';
+      btn7.style.background = '#1f2937'; btn7.style.color = '#6b7280'; btn7.style.borderColor = '#374151';
+    }
+    // Build table rows
+    var body = document.getElementById('rt-body');
+    if (!data.byAgent || data.byAgent.length === 0) {
+      body.innerHTML = '<tr><td colspan="5" style="padding:8px;text-align:center;color:#4b5563">No data for period</td></tr>';
+      return;
+    }
+    var html = '';
+    var agentColors = { main: '#818cf8', axiom: '#34d399', director: '#f472b6', dratlas: '#fbbf24', research: '#a78bfa', comms: '#38bdf8', content: '#fb923c', ops: '#4ade80' };
+    data.byAgent.forEach(function(a) {
+      var color = agentColors[a.agent_id] || '#9ca3af';
+      var inK = (a.total_input / 1000).toFixed(0) + 'k';
+      var outK = (a.total_output / 1000).toFixed(0) + 'k';
+      html += '<tr style="border-bottom:1px solid #111">' +
+        '<td style="padding:3px 4px"><span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:' + color + ';margin-right:4px"></span><span style="color:#d1d5db">' + a.agent_id + '</span></td>' +
+        '<td style="padding:3px 4px;text-align:right;color:#4ade80">$' + a.total_cost.toFixed(2) + '</td>' +
+        '<td style="padding:3px 4px;text-align:right;color:#9ca3af">' + a.turns + '</td>' +
+        '<td style="padding:3px 4px;text-align:right;color:#9ca3af">' + inK + '</td>' +
+        '<td style="padding:3px 4px;text-align:right;color:#9ca3af">' + outK + '</td>' +
+        '</tr>';
+    });
+    body.innerHTML = html;
+  } catch(e) { console.error('Rate tracker error:', e); }
+}
 
 // ── Agent & Hive Mind ────────────────────────────────────────────────
 const AGENT_COLORS = { main: '#4f46e5', comms: '#0ea5e9', content: '#f59e0b', ops: '#10b981', research: '#8b5cf6' };
@@ -1892,7 +1958,7 @@ setInterval(loadMissionControl, 15000);
 async function refreshAll() {
   const btn = document.getElementById('refresh-btn').querySelector('svg');
   btn.classList.add('refresh-spin');
-  await Promise.all([loadInfo(), loadTasks(), loadMemories(), loadHealth(), loadTokens(), loadAgents(), loadHiveMind(), loadSummary(), loadMissionControl()]);
+  await Promise.all([loadInfo(), loadTasks(), loadMemories(), loadHealth(), loadTokens(), loadAgents(), loadHiveMind(), loadSummary(), loadMissionControl(), loadRateTracker(7)]);
   btn.classList.remove('refresh-spin');
   document.getElementById('last-updated').textContent = new Date().toLocaleTimeString();
 }
