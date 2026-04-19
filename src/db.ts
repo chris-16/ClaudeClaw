@@ -308,6 +308,12 @@ export function initDatabase(): void {
   } catch { /* non-fatal on platforms that don't support chmod */ }
 }
 
+/** @internal Expose the shared DB singleton for workers that need a raw handle. */
+export function getDbInstance(): Database.Database {
+  if (!db) throw new Error('Database not initialized. Call initDatabase() first.');
+  return db;
+}
+
 /** Add columns that may not exist in older databases. */
 function runMigrations(database: Database.Database): void {
   // Add context_tokens column to token_usage (introduced for accurate context tracking)

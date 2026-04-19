@@ -19,7 +19,7 @@ import {
 } from './db.js';
 import { cosineSimilarity, embedText } from './embeddings.js';
 import { generateContent, parseJsonResponse } from './gemini.js';
-import { searchKnowledgeSemantic } from './knowledge-graph.js';
+import { decayEntities, invalidateKnowledgeCache, searchKnowledgeSemantic } from './knowledge-graph.js';
 import { logger } from './logger.js';
 import { ingestConversationTurn } from './memory-ingest.js';
 import { buildObsidianContext } from './obsidian.js';
@@ -274,6 +274,18 @@ export function saveConversationTurn(
  */
 export function runDecaySweep(): void {
   decayMemories();
+  // Knowledge graph parallels memory decay: salience drops daily, entities
+  // below 0.05 are deleted (cascade cleans obs + rels). Keeps the KG from
+  // growing unbounded as entities accumulate from auto-extraction.
+  try {
+    const kgResult = decayEntities();
+    if (kgResult.deleted > 0) {
+      invalidateKnowledgeCache();
+      logger.info({ decayed: kgResult.decayed, deleted: kgResult.deleted }, 'KG decay applied');
+    }
+  } catch (err) {
+    logger.debug({ err }, 'KG decay skipped');
+  }
   pruneConversationLog(500);
 
   // Enforce 3-day retention on messaging data

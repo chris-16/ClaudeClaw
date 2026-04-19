@@ -8,6 +8,7 @@ import {
   updateMemoryConnections,
 } from './db.js';
 import { embedText } from './embeddings.js';
+import { createRelation } from './knowledge-graph.js';
 import { logger } from './logger.js';
 
 interface ConsolidationResult {
@@ -53,6 +54,15 @@ If memories are unrelated, still summarize but note they cover different topics.
 
 // Guard against overlapping consolidation runs (keyed by chatId)
 const consolidatingChats = new Set<string>();
+
+function safeParseArray(json: string): string[] {
+  try {
+    const parsed = JSON.parse(json);
+    return Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === 'string' && x.trim().length > 0) : [];
+  } catch {
+    return [];
+  }
+}
 
 /**
  * Run consolidation for a given chat. Finds patterns across unconsolidated
@@ -113,11 +123,12 @@ export async function runConsolidation(chatId: string): Promise<void> {
       logger.warn({ err: embErr, consolidationId }, 'Failed to embed consolidation');
     }
 
-    // Wire up connections between memories
+    // Wire up connections between memories + mirror into the KG as relations
+    // between the entities that appear in each memory. Cross-product is capped
+    // at 2 entities per side to avoid relation explosion.
     if (result.connections && result.connections.length > 0) {
       for (const conn of result.connections) {
         if (!conn.from_id || !conn.to_id) continue;
-        // Verify both IDs are in our source set
         if (!sourceIds.includes(conn.from_id) || !sourceIds.includes(conn.to_id)) continue;
 
         updateMemoryConnections(conn.from_id, [
@@ -126,6 +137,22 @@ export async function runConsolidation(chatId: string): Promise<void> {
         updateMemoryConnections(conn.to_id, [
           { linked_to: conn.from_id, relationship: conn.relationship },
         ]);
+
+        const fromMem = memories.find((m) => m.id === conn.from_id);
+        const toMem = memories.find((m) => m.id === conn.to_id);
+        if (!fromMem || !toMem) continue;
+        const fromEntities = safeParseArray(fromMem.entities).slice(0, 2);
+        const toEntities = safeParseArray(toMem.entities).slice(0, 2);
+        for (const fe of fromEntities) {
+          for (const te of toEntities) {
+            if (fe === te) continue;
+            try {
+              createRelation(chatId, fe, te, conn.relationship || 'related');
+            } catch (relErr) {
+              logger.debug({ err: relErr, from: fe, to: te }, 'KG relation create failed');
+            }
+          }
+        }
       }
     }
 

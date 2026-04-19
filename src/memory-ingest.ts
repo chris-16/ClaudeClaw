@@ -1,6 +1,7 @@
 import { generateContent, parseJsonResponse } from './gemini.js';
 import { cosineSimilarity, embedText } from './embeddings.js';
 import { getMemoriesWithEmbeddings, saveStructuredMemory, saveMemoryEmbedding } from './db.js';
+import { createEntity, invalidateKnowledgeCache } from './knowledge-graph.js';
 import { logger } from './logger.js';
 
 // Callback for notifying when a high-importance memory is created.
@@ -141,6 +142,30 @@ export async function ingestConversationTurn(
     if (embedding.length > 0) {
       saveMemoryEmbedding(memoryId, embedding);
     }
+
+    // Sync extracted entities + topics into the Knowledge Graph.
+    // Topics use lower importance (0.8x) since they're concepts, not actors.
+    // Failures here are non-fatal — memory saving already succeeded.
+    let kgTouched = false;
+    for (const name of result.entities ?? []) {
+      if (!name || !name.trim()) continue;
+      try {
+        createEntity(chatId, name.trim(), 'auto', importance, [result.summary], agentId);
+        kgTouched = true;
+      } catch (kgErr) {
+        logger.debug({ err: kgErr, entity: name }, 'KG entity upsert failed');
+      }
+    }
+    for (const topic of result.topics ?? []) {
+      if (!topic || !topic.trim()) continue;
+      try {
+        createEntity(chatId, topic.trim(), 'concept', importance * 0.8, [result.summary], agentId);
+        kgTouched = true;
+      } catch (kgErr) {
+        logger.debug({ err: kgErr, topic }, 'KG topic upsert failed');
+      }
+    }
+    if (kgTouched) invalidateKnowledgeCache(chatId);
 
     // Notify on high-importance memories so the user can pin them
     if (importance >= 0.8 && onHighImportanceMemory) {

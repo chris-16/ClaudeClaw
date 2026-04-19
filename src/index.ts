@@ -146,6 +146,12 @@ async function main(): Promise<void> {
     cleanupOldMissionTasks(7);
     setInterval(() => { runDecaySweep(); cleanupOldMissionTasks(7); }, 24 * 60 * 60 * 1000);
 
+    // Background worker: backfill missing embeddings for memories / KG / consolidations.
+    // Runs every 30s, respects Gemini rate limits. Main process only so rate
+    // quota isn't split across sub-agents.
+    const { startEmbeddingWorker } = await import('./embedding-worker.js');
+    startEmbeddingWorker();
+
     // Memory consolidation: find patterns across recent memories every 4 hours
     if (ALLOWED_CHAT_ID && GOOGLE_API_KEY) {
       // Delay first consolidation 2 minutes after startup to let things settle
