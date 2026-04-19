@@ -190,6 +190,29 @@ function createSchema(database: Database.Database): void {
 
     CREATE INDEX IF NOT EXISTS idx_slack_messages_channel ON slack_messages(channel_id, created_at DESC);
 
+    CREATE TABLE IF NOT EXISTS embedding_cache (
+      query_hash   TEXT PRIMARY KEY,
+      embedding    TEXT NOT NULL,
+      created_at   INTEGER NOT NULL,
+      accessed_at  INTEGER NOT NULL,
+      access_count INTEGER NOT NULL DEFAULT 1
+    );
+    CREATE INDEX IF NOT EXISTS idx_embedding_cache_accessed ON embedding_cache(accessed_at DESC);
+
+    CREATE TABLE IF NOT EXISTS retrieval_metrics (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      chat_id       TEXT NOT NULL,
+      agent_id      TEXT NOT NULL,
+      query_hash    TEXT NOT NULL,
+      complexity    TEXT NOT NULL,
+      layers_used   TEXT NOT NULL,
+      latency_ms    INTEGER NOT NULL,
+      results_count INTEGER NOT NULL,
+      created_at    INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_retrieval_metrics_time ON retrieval_metrics(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_retrieval_metrics_agent ON retrieval_metrics(agent_id, created_at DESC);
+
     CREATE TABLE IF NOT EXISTS working_memory (
       chat_id    TEXT NOT NULL,
       agent_id   TEXT NOT NULL DEFAULT 'main',
@@ -695,12 +718,16 @@ export function searchMemories(
       const scored = candidates
         .map((c) => {
           const rawScore = cosineSimilarity(queryEmbedding, c.embedding);
+          // Salience weights recency/relevance: decayed memories rank lower.
+          // sqrt() dampens the effect so a slightly decayed match doesn't lose
+          // to an irrelevant fresh one.
+          const salienceWeight = Math.sqrt(Math.max(0.05, c.salience));
           // Agent-boost: the caller's own memories rank ~30% higher without
           // hiding cross-agent data. Keeps shared brain visible.
           const boost = c.agent_id === currentAgentId ? 1.3 : 1.0;
-          return { id: c.id, score: rawScore * boost };
+          return { id: c.id, score: rawScore * salienceWeight * boost };
         })
-        .filter((s) => s.score > 0.3) // minimum similarity threshold
+        .filter((s) => s.score > 0.2) // lower floor since score is boosted
         .sort((a, b) => b.score - a.score)
         .slice(0, limit);
 
@@ -760,15 +787,16 @@ export function saveMemoryEmbedding(memoryId: number, embedding: number[]): void
   db.prepare('UPDATE memories SET embedding = ? WHERE id = ?').run(JSON.stringify(embedding), memoryId);
 }
 
-export function getMemoriesWithEmbeddings(chatId: string): Array<{ id: number; embedding: number[]; summary: string; importance: number; agent_id: string }> {
+export function getMemoriesWithEmbeddings(chatId: string): Array<{ id: number; embedding: number[]; summary: string; importance: number; salience: number; agent_id: string }> {
   const rows = db
-    .prepare('SELECT id, embedding, summary, importance, agent_id FROM memories WHERE chat_id = ? AND embedding IS NOT NULL AND superseded_by IS NULL')
-    .all(chatId) as Array<{ id: number; embedding: string; summary: string; importance: number; agent_id: string }>;
+    .prepare('SELECT id, embedding, summary, importance, salience, agent_id FROM memories WHERE chat_id = ? AND embedding IS NOT NULL AND superseded_by IS NULL')
+    .all(chatId) as Array<{ id: number; embedding: string; summary: string; importance: number; salience: number; agent_id: string }>;
   return rows.map((r) => ({
     id: r.id,
     embedding: JSON.parse(r.embedding) as number[],
     summary: r.summary,
     importance: r.importance,
+    salience: r.salience,
     agent_id: r.agent_id,
   }));
 }
@@ -1726,6 +1754,103 @@ export function getCostByAgent(days: number): Array<{
 }
 
 /** Count of turns since the last memory was saved for a given chat+agent. */
+// ── Embedding cache ────────────────────────────────────────────────
+// Persistent across restarts. Keyed by a short hash of the normalized query
+// (avoids storing the raw query string). Cleanup runs in runDecaySweep.
+
+export function getCachedEmbeddingFromDb(queryHash: string): number[] | null {
+  const row = db
+    .prepare('SELECT embedding FROM embedding_cache WHERE query_hash = ?')
+    .get(queryHash) as { embedding: string } | undefined;
+  if (!row) return null;
+  const now = Math.floor(Date.now() / 1000);
+  db
+    .prepare('UPDATE embedding_cache SET accessed_at = ?, access_count = access_count + 1 WHERE query_hash = ?')
+    .run(now, queryHash);
+  try {
+    return JSON.parse(row.embedding) as number[];
+  } catch {
+    return null;
+  }
+}
+
+export function saveCachedEmbeddingToDb(queryHash: string, embedding: number[]): void {
+  const now = Math.floor(Date.now() / 1000);
+  db
+    .prepare(`
+      INSERT INTO embedding_cache (query_hash, embedding, created_at, accessed_at, access_count)
+      VALUES (?, ?, ?, ?, 1)
+      ON CONFLICT(query_hash) DO UPDATE SET
+        accessed_at = excluded.accessed_at,
+        access_count = embedding_cache.access_count + 1
+    `)
+    .run(queryHash, JSON.stringify(embedding), now, now);
+}
+
+export function pruneEmbeddingCache(maxAgeDays = 30, minAccessesToKeep = 3): number {
+  const threshold = Math.floor(Date.now() / 1000) - maxAgeDays * 86400;
+  const result = db
+    .prepare('DELETE FROM embedding_cache WHERE accessed_at < ? AND access_count < ?')
+    .run(threshold, minAccessesToKeep);
+  return result.changes;
+}
+
+// ── Retrieval metrics ──────────────────────────────────────────────
+// One row per buildMemoryContext call. Retention is bounded by
+// pruneRetrievalMetrics() in runDecaySweep.
+
+export interface RetrievalMetric {
+  chatId: string;
+  agentId: string;
+  queryHash: string;
+  complexity: string;
+  layersUsed: Record<string, number | boolean>;
+  latencyMs: number;
+  resultsCount: number;
+}
+
+export function logRetrievalMetric(m: RetrievalMetric): void {
+  const now = Math.floor(Date.now() / 1000);
+  db
+    .prepare(`
+      INSERT INTO retrieval_metrics (chat_id, agent_id, query_hash, complexity, layers_used, latency_ms, results_count, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `)
+    .run(m.chatId, m.agentId, m.queryHash, m.complexity, JSON.stringify(m.layersUsed), m.latencyMs, m.resultsCount, now);
+}
+
+export function pruneRetrievalMetrics(maxAgeDays = 30): number {
+  const threshold = Math.floor(Date.now() / 1000) - maxAgeDays * 86400;
+  const result = db.prepare('DELETE FROM retrieval_metrics WHERE created_at < ?').run(threshold);
+  return result.changes;
+}
+
+export function getRetrievalStats(hoursBack = 24): {
+  total: number;
+  avgLatencyMs: number;
+  p95LatencyMs: number;
+  avgResults: number;
+  skippedEmbedding: number;
+} {
+  const threshold = Math.floor(Date.now() / 1000) - hoursBack * 3600;
+  const rows = db
+    .prepare('SELECT latency_ms, results_count, layers_used FROM retrieval_metrics WHERE created_at >= ?')
+    .all(threshold) as Array<{ latency_ms: number; results_count: number; layers_used: string }>;
+  if (rows.length === 0) return { total: 0, avgLatencyMs: 0, p95LatencyMs: 0, avgResults: 0, skippedEmbedding: 0 };
+  const latencies = rows.map((r) => r.latency_ms).sort((a, b) => a - b);
+  const p95 = latencies[Math.floor(latencies.length * 0.95)] ?? 0;
+  const avgLatency = Math.round(latencies.reduce((a, b) => a + b, 0) / latencies.length);
+  const avgResults = Math.round((rows.reduce((a, b) => a + b.results_count, 0) / rows.length) * 10) / 10;
+  let skipped = 0;
+  for (const r of rows) {
+    try {
+      const layers = JSON.parse(r.layers_used) as Record<string, unknown>;
+      if (layers.vector === 0) skipped++;
+    } catch { /* skip malformed */ }
+  }
+  return { total: rows.length, avgLatencyMs: avgLatency, p95LatencyMs: p95, avgResults, skippedEmbedding: skipped };
+}
+
 // ── Working memory ─────────────────────────────────────────────────
 // Short-lived per-chat+agent summary. Injected into each turn's context
 // so the assistant has session awareness without re-reading conversation_log.

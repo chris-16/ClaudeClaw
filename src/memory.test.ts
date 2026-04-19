@@ -19,10 +19,17 @@ vi.mock('./db.js', () => ({
   saveWorkingMemorySummary: vi.fn(),
   getAgentRecentConversation: vi.fn(() => []),
   searchConversationHistory: vi.fn(() => []),
+  getCachedEmbeddingFromDb: vi.fn(() => null),
+  saveCachedEmbeddingToDb: vi.fn(),
+  logRetrievalMetric: vi.fn(),
+  pruneEmbeddingCache: vi.fn(() => 0),
+  pruneRetrievalMetrics: vi.fn(() => 0),
 }));
 
 vi.mock('./knowledge-graph.js', () => ({
   searchKnowledgeSemantic: vi.fn(() => []),
+  decayEntities: vi.fn(() => ({ decayed: 0, deleted: 0 })),
+  invalidateKnowledgeCache: vi.fn(),
 }));
 
 vi.mock('./memory-ingest.js', () => ({

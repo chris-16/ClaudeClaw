@@ -1,17 +1,24 @@
+import crypto from 'crypto';
+
 import { agentObsidianConfig, GOOGLE_API_KEY } from './config.js';
 import {
   batchUpdateMemoryRelevance,
   decayMemories,
   getAgentRecentConversation,
+  getCachedEmbeddingFromDb,
   getConsolidationsWithEmbeddings,
   getOtherAgentActivity,
   getRecentConsolidations,
   getRecentHighImportanceMemories,
   getWorkingMemory,
   logConversationTurn,
+  logRetrievalMetric,
   pruneConversationLog,
+  pruneEmbeddingCache,
+  pruneRetrievalMetrics,
   pruneSlackMessages,
   pruneWaMessages,
+  saveCachedEmbeddingToDb,
   saveWorkingMemorySummary,
   searchConsolidations,
   searchConversationHistory,
@@ -40,8 +47,8 @@ export interface MemoryContextResult {
   surfacedMemorySummaries: Map<number, string>;
 }
 
-// In-memory LRU cache for query embeddings. Queries repeat a lot
-// ("revisa mi agenda", "cómo voy con X"), so caching saves ~200ms per hit.
+// Two-tier query embedding cache: in-process LRU for hot queries (0ms),
+// backed by a DB table so repeats survive bot restarts (low-ms lookup).
 const QUERY_CACHE_MAX = 200;
 const QUERY_CACHE_TTL_MS = 60 * 60 * 1000; // 1h
 const queryEmbeddingCache = new Map<string, { embedding: number[]; ts: number }>();
@@ -50,30 +57,76 @@ function normalizeQueryForCache(q: string): string {
   return q.toLowerCase().trim().slice(0, 200);
 }
 
-async function getCachedQueryEmbedding(query: string): Promise<number[] | undefined> {
-  if (!GOOGLE_API_KEY) return undefined;
+function hashQuery(normalized: string): string {
+  return crypto.createHash('sha256').update(normalized).digest('hex').slice(0, 24);
+}
+
+async function getCachedQueryEmbedding(query: string): Promise<{ embedding: number[] | undefined; hash: string }> {
   const key = normalizeQueryForCache(query);
+  const hash = hashQuery(key);
+
+  if (!GOOGLE_API_KEY) return { embedding: undefined, hash };
+
+  // Tier 1: in-process LRU
   const hit = queryEmbeddingCache.get(key);
   if (hit && Date.now() - hit.ts < QUERY_CACHE_TTL_MS) {
-    // Refresh recency: delete+set keeps Map insertion order == LRU order
     queryEmbeddingCache.delete(key);
     queryEmbeddingCache.set(key, hit);
-    logger.debug({ key: key.slice(0, 40) }, 'Embedding cache hit');
-    return hit.embedding;
+    logger.debug({ key: key.slice(0, 40) }, 'Embedding LRU hit');
+    return { embedding: hit.embedding, hash };
   }
+
+  // Tier 2: persistent DB cache
+  try {
+    const fromDb = getCachedEmbeddingFromDb(hash);
+    if (fromDb && fromDb.length > 0) {
+      queryEmbeddingCache.set(key, { embedding: fromDb, ts: Date.now() });
+      logger.debug({ key: key.slice(0, 40) }, 'Embedding DB cache hit');
+      return { embedding: fromDb, hash };
+    }
+  } catch { /* fall through to API */ }
+
+  // Miss: call Gemini, write through to both tiers
   try {
     const embedding = await embedText(query);
-    if (embedding.length === 0) return undefined;
+    if (embedding.length === 0) return { embedding: undefined, hash };
     queryEmbeddingCache.set(key, { embedding, ts: Date.now() });
     if (queryEmbeddingCache.size > QUERY_CACHE_MAX) {
-      // Evict oldest entry (first insertion)
       const oldest = queryEmbeddingCache.keys().next().value;
       if (oldest !== undefined) queryEmbeddingCache.delete(oldest);
     }
-    return embedding;
+    try { saveCachedEmbeddingToDb(hash, embedding); } catch { /* cache write is best-effort */ }
+    return { embedding, hash };
   } catch {
-    return undefined;
+    return { embedding: undefined, hash };
   }
+}
+
+// FTS5-first threshold: if keyword search returns >= this many memories,
+// skip the embedding call and downstream KG+consolidation vector searches.
+// Covers simple/common queries that don't need semantic expansion.
+const FTS5_SUFFICIENCY = 3;
+
+interface QueryComplexity {
+  level: 'low' | 'medium' | 'high';
+  memories: number;
+  recent: number;
+  consolidations: number;
+  kg: number;
+}
+
+function computeComplexity(message: string): QueryComplexity {
+  const words = message.trim().split(/\s+/).length;
+  const hasQuestion = /\?|¿/.test(message);
+  const conjunctions = (message.match(/\b(and|y|o|or|también|además|plus)\b/gi) || []).length;
+
+  if (words > 80 || conjunctions > 2) {
+    return { level: 'high', memories: 10, recent: 8, consolidations: 4, kg: 8 };
+  }
+  if (words > 25 || hasQuestion) {
+    return { level: 'medium', memories: 5, recent: 5, consolidations: 2, kg: 5 };
+  }
+  return { level: 'low', memories: 3, recent: 3, consolidations: 1, kg: 3 };
 }
 
 export async function buildMemoryContext(
@@ -81,32 +134,72 @@ export async function buildMemoryContext(
   userMessage: string,
   agentId = 'main',
 ): Promise<MemoryContextResult> {
+  const startTime = Date.now();
+  const layersUsed = { workingMem: false, fts5: 0, vector: 0, kg: 0, consolidations: 0, conversationHistory: 0 };
   const seen = new Set<number>();
   const summaryMap = new Map<number, string>();
   const memLines: string[] = [];
 
+  const complexity = computeComplexity(userMessage);
+
   // Working memory: short-lived per-agent session summary. 0ms retrieval,
   // gives the assistant immediate session awareness without re-reading history.
   const workingMem = getWorkingMemory(chatId, agentId);
+  layersUsed.workingMem = !!workingMem;
 
-  // Embed the query for vector search. Cached so repeat queries are instant.
-  const queryEmbedding = await getCachedQueryEmbedding(userMessage);
+  // Layer 1a: FTS5-first fast path. No embedding call. If enough matches,
+  // we skip the Gemini embedding and all vector-dependent layers.
+  const ftsMemories = searchMemories(chatId, userMessage, complexity.memories + 2, undefined, agentId);
+  layersUsed.fts5 = ftsMemories.length;
+  const needsVector = ftsMemories.length < FTS5_SUFFICIENCY;
 
-  // Layer 1: semantic search (embedding) with FTS5/LIKE fallback
-  // NOTE: We do NOT touch memories here. The feedback loop (evaluateMemoryRelevance)
-  // is the only thing that should boost salience/accessed_at. Touching at retrieval
-  // creates a positive feedback loop where noise stays fresh forever.
-  const searched = searchMemories(chatId, userMessage, 5, queryEmbedding, agentId);
-  for (const mem of searched) {
-    seen.add(mem.id);
-    summaryMap.set(mem.id, mem.summary);
-    const topics = safeParse(mem.topics);
-    const topicStr = topics.length > 0 ? ` (${topics.join(', ')})` : '';
-    memLines.push(`- [${mem.importance.toFixed(1)}] ${mem.summary}${topicStr}`);
+  // Embed only when FTS5 didn't give us enough results. Cached so repeats are instant.
+  let queryEmbedding: number[] | undefined;
+  let queryHash = '';
+  if (needsVector) {
+    const cached = await getCachedQueryEmbedding(userMessage);
+    queryEmbedding = cached.embedding;
+    queryHash = cached.hash;
+  } else {
+    queryHash = hashQuery(normalizeQueryForCache(userMessage));
+  }
+
+  // Layer 1b: vector search only if FTS5 was sparse. Merge by id and prefer
+  // vector ordering when both returned the same memory.
+  if (queryEmbedding && queryEmbedding.length > 0) {
+    const vectorMemories = searchMemories(chatId, userMessage, complexity.memories, queryEmbedding, agentId);
+    layersUsed.vector = vectorMemories.length;
+    const mergedIds = new Set<number>();
+    for (const mem of vectorMemories) {
+      if (mergedIds.has(mem.id)) continue;
+      mergedIds.add(mem.id);
+      seen.add(mem.id);
+      summaryMap.set(mem.id, mem.summary);
+      const topics = safeParse(mem.topics);
+      const topicStr = topics.length > 0 ? ` (${topics.join(', ')})` : '';
+      memLines.push(`- [${mem.importance.toFixed(1)}] ${mem.summary}${topicStr}`);
+    }
+    for (const mem of ftsMemories) {
+      if (mergedIds.has(mem.id)) continue;
+      mergedIds.add(mem.id);
+      seen.add(mem.id);
+      summaryMap.set(mem.id, mem.summary);
+      const topics = safeParse(mem.topics);
+      const topicStr = topics.length > 0 ? ` (${topics.join(', ')})` : '';
+      memLines.push(`- [${mem.importance.toFixed(1)}] ${mem.summary}${topicStr}`);
+    }
+  } else {
+    for (const mem of ftsMemories.slice(0, complexity.memories)) {
+      seen.add(mem.id);
+      summaryMap.set(mem.id, mem.summary);
+      const topics = safeParse(mem.topics);
+      const topicStr = topics.length > 0 ? ` (${topics.join(', ')})` : '';
+      memLines.push(`- [${mem.importance.toFixed(1)}] ${mem.summary}${topicStr}`);
+    }
   }
 
   // Layer 2: recent high-importance memories (deduplicated)
-  const recent = getRecentHighImportanceMemories(chatId, 5);
+  const recent = getRecentHighImportanceMemories(chatId, complexity.recent);
   for (const mem of recent) {
     if (seen.has(mem.id)) continue;
     seen.add(mem.id);
@@ -116,7 +209,7 @@ export async function buildMemoryContext(
     memLines.push(`- [${mem.importance.toFixed(1)}] ${mem.summary}${topicStr}`);
   }
 
-  // Layer 3: consolidation insights (semantic search with LIKE fallback)
+  // Layer 3: consolidation insights (vector if embedding available, keyword otherwise)
   const insightLines: string[] = [];
 
   if (queryEmbedding && queryEmbedding.length > 0) {
@@ -126,7 +219,7 @@ export async function buildMemoryContext(
         .map((c) => ({ ...c, score: cosineSimilarity(queryEmbedding, c.embedding) }))
         .filter((s) => s.score > 0.3)
         .sort((a, b) => b.score - a.score)
-        .slice(0, 2);
+        .slice(0, complexity.consolidations);
       for (const c of scored) {
         insightLines.push(`- ${c.insight}`);
       }
@@ -134,9 +227,9 @@ export async function buildMemoryContext(
   }
 
   if (insightLines.length === 0) {
-    const consolidations = searchConsolidations(chatId, userMessage, 2);
+    const consolidations = searchConsolidations(chatId, userMessage, complexity.consolidations);
     if (consolidations.length === 0) {
-      const recentInsights = getRecentConsolidations(chatId, 2);
+      const recentInsights = getRecentConsolidations(chatId, complexity.consolidations);
       for (const c of recentInsights) {
         insightLines.push(`- ${c.insight}`);
       }
@@ -146,16 +239,18 @@ export async function buildMemoryContext(
       }
     }
   }
+  layersUsed.consolidations = insightLines.length;
 
   // Layer 6: Knowledge Graph semantic retrieval.
-  // Reuses the cached query embedding, applies agent-id boost so the caller's
-  // own knowledge ranks higher without hiding cross-agent observations.
-  // Kept compact (3 hits, 180 chars each) so long resumed sessions don't
-  // accumulate enough per-turn bytes to blow past the model context window.
+  // Adaptive limits (low=3, medium=5, high=8) keep per-turn context small
+  // for simple queries so long resumed sessions don't blow past the model
+  // context window, but expand for complex ones that need deeper recall.
+  // Only runs when we have a query embedding (FTS5 didn't cover the query).
   const kgLines: string[] = [];
   if (queryEmbedding && queryEmbedding.length > 0) {
     try {
-      const kgHits = searchKnowledgeSemantic(chatId, queryEmbedding, 3, agentId);
+      const kgHits = searchKnowledgeSemantic(chatId, queryEmbedding, complexity.kg, agentId);
+      layersUsed.kg = kgHits.length;
       for (const h of kgHits) {
         const own = h.agentId === agentId ? '' : ` (${h.agentId})`;
         kgLines.push(`- ${h.entityName}${own}: ${h.content.slice(0, 180)}`);
@@ -231,7 +326,23 @@ export async function buildMemoryContext(
   const obsidianBlock = buildObsidianContext(agentObsidianConfig);
   if (obsidianBlock) parts.push(obsidianBlock);
 
-  return { contextText: parts.join('\n\n'), surfacedMemoryIds: [...seen], surfacedMemorySummaries: summaryMap };
+  const contextText = parts.join('\n\n');
+
+  // Log one metric per call so we can tune the FTS5 sufficiency threshold
+  // and adaptive limits based on real usage rather than guesses.
+  try {
+    logRetrievalMetric({
+      chatId,
+      agentId,
+      queryHash,
+      complexity: complexity.level,
+      layersUsed,
+      latencyMs: Date.now() - startTime,
+      resultsCount: memLines.length + kgLines.length + insightLines.length,
+    });
+  } catch { /* metrics are best-effort */ }
+
+  return { contextText, surfacedMemoryIds: [...seen], surfacedMemorySummaries: summaryMap };
 }
 
 /**
@@ -287,6 +398,17 @@ export function runDecaySweep(): void {
     logger.debug({ err }, 'KG decay skipped');
   }
   pruneConversationLog(500);
+
+  // Cache and metrics hygiene: keep only useful / recent entries.
+  try {
+    const cachePruned = pruneEmbeddingCache(30, 3);
+    const metricsPruned = pruneRetrievalMetrics(30);
+    if (cachePruned > 0 || metricsPruned > 0) {
+      logger.info({ cachePruned, metricsPruned }, 'Cache/metrics cleanup');
+    }
+  } catch (err) {
+    logger.debug({ err }, 'Cache/metrics cleanup skipped');
+  }
 
   // Enforce 3-day retention on messaging data
   const wa = pruneWaMessages(3);
