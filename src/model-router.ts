@@ -8,6 +8,7 @@
  *   Opus   — explicit multi-step, long code reviews, deep analysis
  */
 
+import { CONTEXT_LIMIT } from './config.js';
 import { logger } from './logger.js';
 
 export type ModelTier = 'haiku' | 'sonnet' | 'opus';
@@ -17,6 +18,33 @@ const MODEL_IDS: Record<ModelTier, string> = {
   sonnet: 'claude-sonnet-4-5',
   opus: 'claude-opus-4-6',
 };
+
+// Per-model context windows. Sonnet/Haiku are 200k; Opus 4.6 with the 1M
+// flag is 1M. Values are conservative — if an env var CONTEXT_LIMIT is set
+// higher than what a model supports, we still cap at the model's real limit.
+// Keep this in sync when adding new model variants (e.g., Opus 4-7 [1m]).
+export const MODEL_CONTEXT_LIMITS: Record<string, number> = {
+  'claude-haiku-4-5': 200_000,
+  'claude-sonnet-4-5': 200_000,
+  'claude-sonnet-4-6': 200_000,
+  'claude-opus-4-6': 1_000_000,
+  'claude-opus-4-7': 1_000_000,
+};
+
+/**
+ * Return the context window size for a given model id. Falls back to the
+ * global CONTEXT_LIMIT env var when the model isn't in our map (new variants
+ * or custom model strings).
+ */
+export function getContextLimitForModel(modelId: string | undefined): number {
+  if (!modelId) return CONTEXT_LIMIT;
+  return MODEL_CONTEXT_LIMITS[modelId] ?? CONTEXT_LIMIT;
+}
+
+// When the live session has already accumulated this many tokens, routing
+// must pick a model whose context window is large enough to fit it. Otherwise
+// the Claude Code subprocess returns "Prompt is too long" mid-turn.
+const CONTEXT_HEADROOM = 20_000;
 
 // Patterns that signal complex work (upgrade to Opus)
 const OPUS_PATTERNS = [
@@ -106,4 +134,46 @@ export function applyBudgetOverride(decision: RoutingDecision, budgetPct: number
     return { tier: 'haiku', modelId: MODEL_IDS.haiku, reason: `budget override (${budgetPct}% spent)` };
   }
   return decision;
+}
+
+/**
+ * Force Opus when the accumulated session context no longer fits the routed
+ * model's window. Prevents the "Prompt is too long" failure path observed in
+ * production when a short user turn was routed to Haiku but the session had
+ * already grown past 160k tokens.
+ *
+ * Called after applyBudgetOverride so a 95%+ budget Haiku override can still
+ * be upgraded if it would otherwise crash — keeping the bot responsive
+ * matters more than shaving a few cents on a single turn.
+ */
+export function applyContextOverride(
+  decision: RoutingDecision,
+  sessionContextTokens: number,
+): RoutingDecision {
+  if (sessionContextTokens <= 0) return decision;
+  const required = sessionContextTokens + CONTEXT_HEADROOM;
+  const currentLimit = getContextLimitForModel(decision.modelId);
+  if (required <= currentLimit) return decision;
+
+  const opusLimit = getContextLimitForModel(MODEL_IDS.opus);
+  if (required > opusLimit) {
+    // Even Opus can't hold it — let the turn fail naturally so the user hits
+    // the existing "context exhausted" messaging path and runs /newchat.
+    logger.warn(
+      { sessionContextTokens, opusLimit },
+      'Session exceeds every available model context window',
+    );
+    return decision;
+  }
+
+  logger.info(
+    { originalTier: decision.tier, sessionContextTokens, modelLimit: currentLimit },
+    'Context override: upgrading to Opus for session size',
+  );
+  const kb = Math.round(sessionContextTokens / 1000);
+  return {
+    tier: 'opus',
+    modelId: MODEL_IDS.opus,
+    reason: `context override: session ${kb}k > ${decision.modelId} limit`,
+  };
 }

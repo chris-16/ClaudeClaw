@@ -27,7 +27,7 @@ import { clearSession, getRecentConversation, getRecentMemories, getRecentTaskOu
 import { logger } from './logger.js';
 import { downloadMedia, buildPhotoMessage, buildDocumentMessage, buildVideoMessage } from './media.js';
 import { buildMemoryContext, evaluateMemoryRelevance, saveConversationTurn, updateWorkingMemory } from './memory.js';
-import { routeMessage, applyBudgetOverride, type RoutingDecision } from './model-router.js';
+import { routeMessage, applyBudgetOverride, applyContextOverride, getContextLimitForModel, type RoutingDecision } from './model-router.js';
 import { redactSensitiveValues } from './exfil-guard.js';
 import { setHighImportanceCallback } from './memory-ingest.js';
 import { messageQueue } from './message-queue.js';
@@ -60,10 +60,14 @@ const GLOBAL_STREAM_INTERVAL_MS = 2500;
 const CONTEXT_WARN_PCT = 0.75; // Warn when conversation fills 75% of available space
 const lastUsage = new Map<string, UsageInfo>();
 const sessionBaseline = new Map<string, number>(); // sessionId -> first turn's input_tokens
+const lastModelByChat = new Map<string, string>(); // chatId -> last modelId routed to, for model-aware warning
 
 /**
  * Check if context usage is getting high and return a warning string, or null.
- * Uses input_tokens (total context) not cache_read_input_tokens (partial metric).
+ * Compares against the *current model's* context window (haiku=200k, opus=1M),
+ * not a global assumption. Previously the warning used CONTEXT_LIMIT (1M)
+ * even when the router sent the turn to Haiku, so 160k sessions crashed
+ * with zero warning.
  */
 function checkContextWarning(chatId: string, sessionId: string | undefined, usage: UsageInfo): string | null {
   lastUsage.set(chatId, usage);
@@ -79,19 +83,21 @@ function checkContextWarning(chatId: string, sessionId: string | undefined, usag
   const baseKey = sessionId ?? chatId;
   if (!sessionBaseline.has(baseKey)) {
     sessionBaseline.set(baseKey, contextTokens);
-    // First turn — no warning, just establishing baseline
     return null;
   }
 
   const baseline = sessionBaseline.get(baseKey)!;
-  const available = CONTEXT_LIMIT - baseline;
+  const modelId = lastModelByChat.get(chatId);
+  const modelLimit = getContextLimitForModel(modelId);
+  const available = modelLimit - baseline;
   if (available <= 0) return null;
 
   const conversationTokens = contextTokens - baseline;
   const pct = Math.round((conversationTokens / available) * 100);
 
   if (pct >= Math.round(CONTEXT_WARN_PCT * 100)) {
-    return `⚠️ Context window at ~${pct}% of available space (~${Math.round(conversationTokens / 1000)}k / ${Math.round(available / 1000)}k conversation tokens). Consider /newchat + /respin soon.`;
+    const modelTag = modelId ? modelId.replace('claude-', '') : 'current model';
+    return `⚠️ Context at ~${pct}% of ${modelTag} window (~${Math.round(conversationTokens / 1000)}k / ${Math.round(available / 1000)}k). Consider /newchat + /respin soon.`;
   }
 
   return null;
@@ -534,8 +540,19 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
       routingDecision = applyBudgetOverride(routingDecision, budgetPct);
     }
 
+    // Context check: if the resumed session already exceeds the routed
+    // model's window, upgrade so Claude Code doesn't return "Prompt is too long".
+    const sessionCtx = lastUsage.get(chatIdStr)?.lastCallInputTokens ?? 0;
+    if (sessionCtx > 0) {
+      routingDecision = applyContextOverride(routingDecision, sessionCtx);
+    }
+
     routedModel = routingDecision.modelId;
+    lastModelByChat.set(chatIdStr, routedModel);
     logger.info({ tier: routingDecision.tier, reason: routingDecision.reason, model: routedModel }, 'Smart routing');
+  } else if (manualOverride) {
+    // Manual /model override: still track the model so the warning picks the right window.
+    lastModelByChat.set(chatIdStr, manualOverride);
   }
 
   // Start typing immediately, then refresh on interval
