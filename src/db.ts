@@ -5,6 +5,7 @@ import path from 'path';
 
 import { DB_ENCRYPTION_KEY, STORE_DIR } from './config.js';
 import { cosineSimilarity } from './embeddings.js';
+import { initKnowledgeGraph } from './knowledge-graph.js';
 import { logger } from './logger.js';
 
 // ── Field-Level Encryption (AES-256-GCM) ────────────────────────────
@@ -285,6 +286,9 @@ export function initDatabase(): void {
   db.pragma('journal_mode = WAL');
   createSchema(db);
   runMigrations(db);
+  // Knowledge graph shares this DB connection. Init here so memory.ts can
+  // query kg_* tables directly without spawning a second connection.
+  initKnowledgeGraph(db);
 
   // Restrict database file permissions (owner-only read/write)
   try {
@@ -544,6 +548,7 @@ export function _initTestDatabase(): void {
   db.pragma('journal_mode = WAL');
   createSchema(db);
   runMigrations(db);
+  initKnowledgeGraph(db);
 }
 
 export function getSession(chatId: string, agentId = 'main'): string | undefined {
@@ -667,13 +672,20 @@ export function searchMemories(
   query: string,
   limit = 5,
   queryEmbedding?: number[],
+  currentAgentId: string = 'main',
 ): Memory[] {
   // Strategy 1: Vector similarity search (if embedding provided)
   if (queryEmbedding && queryEmbedding.length > 0) {
     const candidates = getMemoriesWithEmbeddings(chatId);
     if (candidates.length > 0) {
       const scored = candidates
-        .map((c) => ({ id: c.id, score: cosineSimilarity(queryEmbedding, c.embedding) }))
+        .map((c) => {
+          const rawScore = cosineSimilarity(queryEmbedding, c.embedding);
+          // Agent-boost: the caller's own memories rank ~30% higher without
+          // hiding cross-agent data. Keeps shared brain visible.
+          const boost = c.agent_id === currentAgentId ? 1.3 : 1.0;
+          return { id: c.id, score: rawScore * boost };
+        })
         .filter((s) => s.score > 0.3) // minimum similarity threshold
         .sort((a, b) => b.score - a.score)
         .slice(0, limit);
@@ -734,15 +746,16 @@ export function saveMemoryEmbedding(memoryId: number, embedding: number[]): void
   db.prepare('UPDATE memories SET embedding = ? WHERE id = ?').run(JSON.stringify(embedding), memoryId);
 }
 
-export function getMemoriesWithEmbeddings(chatId: string): Array<{ id: number; embedding: number[]; summary: string; importance: number }> {
+export function getMemoriesWithEmbeddings(chatId: string): Array<{ id: number; embedding: number[]; summary: string; importance: number; agent_id: string }> {
   const rows = db
-    .prepare('SELECT id, embedding, summary, importance FROM memories WHERE chat_id = ? AND embedding IS NOT NULL AND superseded_by IS NULL')
-    .all(chatId) as Array<{ id: number; embedding: string; summary: string; importance: number }>;
+    .prepare('SELECT id, embedding, summary, importance, agent_id FROM memories WHERE chat_id = ? AND embedding IS NOT NULL AND superseded_by IS NULL')
+    .all(chatId) as Array<{ id: number; embedding: string; summary: string; importance: number; agent_id: string }>;
   return rows.map((r) => ({
     id: r.id,
     embedding: JSON.parse(r.embedding) as number[],
     summary: r.summary,
     importance: r.importance,
+    agent_id: r.agent_id,
   }));
 }
 

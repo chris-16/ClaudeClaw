@@ -30,6 +30,21 @@ export async function embedText(text: string): Promise<number[]> {
 }
 
 /**
+ * Batch-embed N texts in parallel. Returns one vector per input, in order.
+ * Throws if the API fails; callers should handle partial failure if needed.
+ */
+export async function embedTextBatch(texts: string[]): Promise<number[][]> {
+  if (texts.length === 0) return [];
+  const ai = getClient();
+  const results = await Promise.all(
+    texts.map((text) =>
+      ai.models.embedContent({ model: EMBEDDING_MODEL, contents: text }),
+    ),
+  );
+  return results.map((r) => r.embeddings?.[0]?.values ?? []);
+}
+
+/**
  * Cosine similarity between two vectors. Returns -1 to 1.
  */
 export function cosineSimilarity(a: number[], b: number[]): number {

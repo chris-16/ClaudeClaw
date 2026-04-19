@@ -93,10 +93,11 @@ export async function ingestConversationTurn(
       return false;
     }
 
-    // Hard filter: only save memories with meaningful importance.
-    // 0.5 threshold ensures only genuinely useful context gets through.
-    // The 0.3-0.4 tier was almost entirely noise (task logs, form steps).
-    if (result.importance < 0.5) return false;
+    // Hard filter: save memories above a minimum importance bar.
+    // 0.35 captures the "useful context" tier (location, timelines, data
+    // freshness) that 0.5 was filtering out. The 5%/day decay in decayMemories
+    // gives these ~90 days to prove their value before being pruned.
+    if (result.importance < 0.35) return false;
 
     // Clamp importance to valid range
     const importance = Math.max(0, Math.min(1, result.importance));

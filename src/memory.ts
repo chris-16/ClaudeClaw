@@ -16,6 +16,7 @@ import {
 } from './db.js';
 import { cosineSimilarity, embedText } from './embeddings.js';
 import { generateContent, parseJsonResponse } from './gemini.js';
+import { searchKnowledgeSemantic } from './knowledge-graph.js';
 import { logger } from './logger.js';
 import { ingestConversationTurn } from './memory-ingest.js';
 import { buildObsidianContext } from './obsidian.js';
@@ -36,6 +37,42 @@ export interface MemoryContextResult {
   surfacedMemorySummaries: Map<number, string>;
 }
 
+// In-memory LRU cache for query embeddings. Queries repeat a lot
+// ("revisa mi agenda", "cómo voy con X"), so caching saves ~200ms per hit.
+const QUERY_CACHE_MAX = 200;
+const QUERY_CACHE_TTL_MS = 60 * 60 * 1000; // 1h
+const queryEmbeddingCache = new Map<string, { embedding: number[]; ts: number }>();
+
+function normalizeQueryForCache(q: string): string {
+  return q.toLowerCase().trim().slice(0, 200);
+}
+
+async function getCachedQueryEmbedding(query: string): Promise<number[] | undefined> {
+  if (!GOOGLE_API_KEY) return undefined;
+  const key = normalizeQueryForCache(query);
+  const hit = queryEmbeddingCache.get(key);
+  if (hit && Date.now() - hit.ts < QUERY_CACHE_TTL_MS) {
+    // Refresh recency: delete+set keeps Map insertion order == LRU order
+    queryEmbeddingCache.delete(key);
+    queryEmbeddingCache.set(key, hit);
+    logger.debug({ key: key.slice(0, 40) }, 'Embedding cache hit');
+    return hit.embedding;
+  }
+  try {
+    const embedding = await embedText(query);
+    if (embedding.length === 0) return undefined;
+    queryEmbeddingCache.set(key, { embedding, ts: Date.now() });
+    if (queryEmbeddingCache.size > QUERY_CACHE_MAX) {
+      // Evict oldest entry (first insertion)
+      const oldest = queryEmbeddingCache.keys().next().value;
+      if (oldest !== undefined) queryEmbeddingCache.delete(oldest);
+    }
+    return embedding;
+  } catch {
+    return undefined;
+  }
+}
+
 export async function buildMemoryContext(
   chatId: string,
   userMessage: string,
@@ -45,21 +82,14 @@ export async function buildMemoryContext(
   const summaryMap = new Map<number, string>();
   const memLines: string[] = [];
 
-  // Embed the query for vector search (async, adds ~200ms but gives semantic results)
-  let queryEmbedding: number[] | undefined;
-  if (GOOGLE_API_KEY) {
-    try {
-      queryEmbedding = await embedText(userMessage);
-    } catch {
-      // Embedding failure is non-fatal; falls back to keyword search
-    }
-  }
+  // Embed the query for vector search. Cached so repeat queries are instant.
+  const queryEmbedding = await getCachedQueryEmbedding(userMessage);
 
   // Layer 1: semantic search (embedding) with FTS5/LIKE fallback
   // NOTE: We do NOT touch memories here. The feedback loop (evaluateMemoryRelevance)
   // is the only thing that should boost salience/accessed_at. Touching at retrieval
   // creates a positive feedback loop where noise stays fresh forever.
-  const searched = searchMemories(chatId, userMessage, 5, queryEmbedding);
+  const searched = searchMemories(chatId, userMessage, 5, queryEmbedding, agentId);
   for (const mem of searched) {
     seen.add(mem.id);
     summaryMap.set(mem.id, mem.summary);
@@ -110,7 +140,23 @@ export async function buildMemoryContext(
     }
   }
 
-  if (memLines.length === 0 && insightLines.length === 0 && !agentObsidianConfig) {
+  // Layer 6: Knowledge Graph semantic retrieval.
+  // Reuses the cached query embedding, applies agent-id boost so the caller's
+  // own knowledge ranks higher without hiding cross-agent observations.
+  const kgLines: string[] = [];
+  if (queryEmbedding && queryEmbedding.length > 0) {
+    try {
+      const kgHits = searchKnowledgeSemantic(chatId, queryEmbedding, 5, agentId);
+      for (const h of kgHits) {
+        const own = h.agentId === agentId ? '' : ` (from ${h.agentId})`;
+        kgLines.push(`- [KG] ${h.entityName}${own}: ${h.content.slice(0, 300)}`);
+      }
+    } catch (err) {
+      logger.debug({ err }, 'Knowledge graph retrieval skipped');
+    }
+  }
+
+  if (memLines.length === 0 && insightLines.length === 0 && kgLines.length === 0 && !agentObsidianConfig) {
     return { contextText: '', surfacedMemoryIds: [], surfacedMemorySummaries: new Map() };
   }
 
@@ -129,6 +175,10 @@ export async function buildMemoryContext(
     }
     blocks.push('[End memory context]');
     parts.push(blocks.join('\n'));
+  }
+
+  if (kgLines.length > 0) {
+    parts.push(`[Knowledge graph]\n${kgLines.join('\n')}\n[End knowledge graph]`);
   }
 
   // Layer 4: Cross-agent activity awareness
