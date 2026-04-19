@@ -2,14 +2,17 @@ import { agentObsidianConfig, GOOGLE_API_KEY } from './config.js';
 import {
   batchUpdateMemoryRelevance,
   decayMemories,
+  getAgentRecentConversation,
   getConsolidationsWithEmbeddings,
   getOtherAgentActivity,
   getRecentConsolidations,
   getRecentHighImportanceMemories,
+  getWorkingMemory,
   logConversationTurn,
   pruneConversationLog,
   pruneSlackMessages,
   pruneWaMessages,
+  saveWorkingMemorySummary,
   searchConsolidations,
   searchConversationHistory,
   searchMemories,
@@ -81,6 +84,10 @@ export async function buildMemoryContext(
   const seen = new Set<number>();
   const summaryMap = new Map<number, string>();
   const memLines: string[] = [];
+
+  // Working memory: short-lived per-agent session summary. 0ms retrieval,
+  // gives the assistant immediate session awareness without re-reading history.
+  const workingMem = getWorkingMemory(chatId, agentId);
 
   // Embed the query for vector search. Cached so repeat queries are instant.
   const queryEmbedding = await getCachedQueryEmbedding(userMessage);
@@ -158,11 +165,17 @@ export async function buildMemoryContext(
     }
   }
 
-  if (memLines.length === 0 && insightLines.length === 0 && kgLines.length === 0 && !agentObsidianConfig) {
+  if (memLines.length === 0 && insightLines.length === 0 && kgLines.length === 0 && !workingMem && !agentObsidianConfig) {
     return { contextText: '', surfacedMemoryIds: [], surfacedMemorySummaries: new Map() };
   }
 
   const parts: string[] = [];
+
+  // Working memory goes first so the assistant has session context before
+  // consuming the retrieved memories and KG hits.
+  if (workingMem) {
+    parts.push(`[Working memory — current session focus]\n${workingMem}\n[End working memory]`);
+  }
 
   if (memLines.length > 0 || insightLines.length > 0) {
     const blocks: string[] = ['[Memory context]'];
@@ -271,6 +284,48 @@ export function runDecaySweep(): void {
       { wa_messages: wa.messages, wa_outbox: wa.outbox, wa_map: wa.map, slack },
       'Retention pruning complete',
     );
+  }
+}
+
+/**
+ * Summarize the last ~10 conversation turns and persist as working memory.
+ * Fire-and-forget. Silently no-ops if Gemini fails or GOOGLE_API_KEY is missing.
+ * Used by the bot trigger every 5 turns so the assistant always has an up-to-date
+ * session summary injected without bloating the context.
+ */
+export async function updateWorkingMemory(chatId: string, agentId: string): Promise<void> {
+  if (!GOOGLE_API_KEY) return;
+  const recent = getAgentRecentConversation(agentId, chatId, 10);
+  if (recent.length < 2) return;
+
+  // getAgentRecentConversation returns DESC, flip to chronological for the prompt
+  const chronological = recent.slice().reverse();
+  const transcript = chronological
+    .map((t) => `${t.role === 'user' ? 'User' : 'Assistant'}: ${t.content.slice(0, 400)}`)
+    .join('\n');
+
+  const prompt = `Summarize the current conversation focus in 2-3 sentences. Factual and concise. Capture:
+- What the user is working on right now
+- Any time-sensitive context (location, deadlines, data freshness)
+- Key decisions or action items
+
+Do NOT include greetings or filler. No preamble, just the summary.
+
+Conversation:
+${transcript}
+
+Summary:`;
+
+  try {
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error('Working memory update timeout')), 10000),
+    );
+    const summary = (await Promise.race([generateContent(prompt), timeoutPromise])).trim();
+    if (summary.length > 0) {
+      saveWorkingMemorySummary(chatId, agentId, summary);
+    }
+  } catch (err) {
+    logger.debug({ err }, 'Working memory update failed');
   }
 }
 

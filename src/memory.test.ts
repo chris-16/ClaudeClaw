@@ -15,6 +15,14 @@ vi.mock('./db.js', () => ({
   pruneSlackMessages: vi.fn(() => 0),
   searchConsolidations: vi.fn(),
   getRecentConsolidations: vi.fn(),
+  getWorkingMemory: vi.fn(() => null),
+  saveWorkingMemorySummary: vi.fn(),
+  getAgentRecentConversation: vi.fn(() => []),
+  searchConversationHistory: vi.fn(() => []),
+}));
+
+vi.mock('./knowledge-graph.js', () => ({
+  searchKnowledgeSemantic: vi.fn(() => []),
 }));
 
 vi.mock('./memory-ingest.js', () => ({

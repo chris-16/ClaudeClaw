@@ -190,6 +190,14 @@ function createSchema(database: Database.Database): void {
 
     CREATE INDEX IF NOT EXISTS idx_slack_messages_channel ON slack_messages(channel_id, created_at DESC);
 
+    CREATE TABLE IF NOT EXISTS working_memory (
+      chat_id    TEXT NOT NULL,
+      agent_id   TEXT NOT NULL DEFAULT 'main',
+      summary    TEXT NOT NULL DEFAULT '',
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (chat_id, agent_id)
+    );
+
     CREATE TABLE IF NOT EXISTS hive_mind (
       id          INTEGER PRIMARY KEY AUTOINCREMENT,
       agent_id    TEXT NOT NULL,
@@ -1712,6 +1720,35 @@ export function getCostByAgent(days: number): Array<{
 }
 
 /** Count of turns since the last memory was saved for a given chat+agent. */
+// ── Working memory ─────────────────────────────────────────────────
+// Short-lived per-chat+agent summary. Injected into each turn's context
+// so the assistant has session awareness without re-reading conversation_log.
+
+export function getWorkingMemory(chatId: string, agentId: string, maxAgeMs = 24 * 60 * 60 * 1000): string | null {
+  const row = db
+    .prepare(
+      `SELECT summary, updated_at FROM working_memory
+       WHERE chat_id = ? AND agent_id = ?`,
+    )
+    .get(chatId, agentId) as { summary: string; updated_at: number } | undefined;
+  if (!row) return null;
+  if (Date.now() - row.updated_at * 1000 > maxAgeMs) return null;
+  return row.summary || null;
+}
+
+export function saveWorkingMemorySummary(chatId: string, agentId: string, summary: string): void {
+  const now = Math.floor(Date.now() / 1000);
+  db
+    .prepare(
+      `INSERT INTO working_memory (chat_id, agent_id, summary, updated_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(chat_id, agent_id) DO UPDATE SET
+         summary = excluded.summary,
+         updated_at = excluded.updated_at`,
+    )
+    .run(chatId, agentId, summary, now);
+}
+
 export function turnsSinceLastMemory(chatId: string, agentId: string): number {
   const lastMemory = db
     .prepare(
