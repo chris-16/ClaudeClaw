@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 
+import { ENABLE_REVERSE_GEOCODING } from './config.js';
 import {
   createMissionTask,
   findPlaceByCoordinates,
@@ -11,6 +12,7 @@ import {
   upsertPlace,
   wasNudgedRecently,
 } from './db.js';
+import { extractPlaceName, reverseGeocode } from './geocoding.js';
 import { logger } from './logger.js';
 
 const DEFAULT_USER_ID = 'chris';
@@ -45,11 +47,18 @@ export async function ingestOwnTracksPayload(
     }
 
     // Match coordinates against known places for semantic location
+    // If no match and geocoding is enabled, reverse geocode and cache
     if (typeof e.lat === 'number' && typeof e.lon === 'number') {
       try {
         const place = findPlaceByCoordinates(e.lat, e.lon);
         if (place) {
           logger.debug({ place: place.name, lat: e.lat, lon: e.lon }, 'Matched location to place');
+        } else if (e._type === 'location') {
+          // Only geocode regular location pings (not transitions - those create places anyway)
+          // This runs async and doesn't block the ingestion flow
+          maybeReverseGeocodeAndCache(e.lat, e.lon).catch((err) => {
+            logger.debug({ err }, 'Background reverse geocoding failed');
+          });
         }
       } catch (err) {
         logger.debug({ err }, 'Place matching failed');
@@ -101,6 +110,50 @@ function autoCreatePlaceFromRegion(e: OwnTracksPayload): void {
   });
 
   logger.info({ placeId, name: e.desc, lat: e.lat, lon: e.lon }, 'Auto-created place from OwnTracks region');
+}
+
+/**
+ * Reverse geocode a location and cache it as a place.
+ * Only runs if ENABLE_REVERSE_GEOCODING is true.
+ * Respects Nominatim rate limits (1 req/sec).
+ */
+async function maybeReverseGeocodeAndCache(lat: number, lon: number): Promise<void> {
+  if (!ENABLE_REVERSE_GEOCODING) return;
+
+  try {
+    const result = await reverseGeocode(lat, lon);
+    if (!result) return;
+
+    // Extract a meaningful place name
+    const placeName = extractPlaceName(result);
+    const placeId = `geocoded-${lat.toFixed(4)}-${lon.toFixed(4)}`
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-');
+
+    // Cache as a place with a small radius (50m) since it's auto-generated
+    upsertPlace({
+      id: placeId,
+      name: placeName,
+      lat,
+      lon,
+      radius: 50,
+      type: 'geocoded',
+      city: result.city,
+      country: result.country,
+      metadata: JSON.stringify({
+        displayName: result.displayName,
+        address: result.address,
+        geocodedAt: new Date().toISOString(),
+      }),
+    });
+
+    logger.info(
+      { placeId, name: placeName, lat, lon, city: result.city },
+      'Cached reverse-geocoded location as place',
+    );
+  } catch (err) {
+    logger.error({ err, lat, lon }, 'Reverse geocoding failed');
+  }
 }
 
 function maybeEnqueueTransitionNudge(userId: string, e: OwnTracksPayload): void {

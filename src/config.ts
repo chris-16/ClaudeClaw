@@ -26,6 +26,7 @@ const envConfig = readEnvFile([
   'DAILY_BUDGET_USD',
   'MONTHLY_BUDGET_USD',
   'SMART_ROUTING',
+  'ENABLE_REVERSE_GEOCODING',
 ]);
 
 // ── Multi-agent support ──────────────────────────────────────────────
@@ -139,6 +140,19 @@ export const DASHBOARD_TOKEN =
   process.env.DASHBOARD_TOKEN || envConfig.DASHBOARD_TOKEN || '';
 export const DASHBOARD_URL =
   process.env.DASHBOARD_URL || envConfig.DASHBOARD_URL || '';
+
+// OwnTracks webhook shared secret. Sent as ?token= in the URL from the
+// phone app; validated in src/dashboard.ts before the global dashboard token
+// middleware runs. Separate from DASHBOARD_TOKEN so they can rotate independently.
+export const OWNTRACKS_TOKEN =
+  process.env.OWNTRACKS_TOKEN || envConfig.OWNTRACKS_TOKEN || '';
+
+// Enable reverse geocoding for unknown locations (Nominatim/OSM).
+// When enabled, coordinates not matching any known place will be geocoded
+// and cached in the places database. Respects 1 req/sec rate limit.
+export const ENABLE_REVERSE_GEOCODING =
+  process.env.ENABLE_REVERSE_GEOCODING === 'true' ||
+  envConfig.ENABLE_REVERSE_GEOCODING === 'true';
 
 // Database encryption key (SQLCipher). Required for encrypted database access.
 export const DB_ENCRYPTION_KEY =
