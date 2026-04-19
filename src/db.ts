@@ -221,6 +221,50 @@ function createSchema(database: Database.Database): void {
       PRIMARY KEY (chat_id, agent_id)
     );
 
+    -- ── OwnTracks location awareness ──────────────────────────────
+    -- Raw ingest log (audit / history). 30-day retention on 'location'
+    -- rows; 'transition' rows kept forever (semantic, tiny, useful).
+    CREATE TABLE IF NOT EXISTS location_events (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id     TEXT NOT NULL DEFAULT 'chris',
+      tst         INTEGER NOT NULL,
+      received_at INTEGER NOT NULL,
+      type        TEXT NOT NULL,
+      event       TEXT,
+      region      TEXT,
+      lat         REAL,
+      lon         REAL,
+      accuracy    INTEGER,
+      velocity    INTEGER,
+      battery     INTEGER,
+      raw_json    TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_loc_events_tst      ON location_events(user_id, tst DESC);
+    CREATE INDEX IF NOT EXISTS idx_loc_events_received ON location_events(received_at DESC);
+
+    -- Single-row current state per user_id (last-tst-wins upsert).
+    -- The five agents all read this to know where Chris is right now.
+    CREATE TABLE IF NOT EXISTS current_location (
+      user_id                 TEXT PRIMARY KEY,
+      region                  TEXT,
+      lat                     REAL,
+      lon                     REAL,
+      tst                     INTEGER NOT NULL,
+      updated_at              INTEGER NOT NULL,
+      last_transition_event   TEXT,
+      last_transition_region  TEXT,
+      last_transition_tst     INTEGER
+    );
+
+    -- Dedup guard for transition nudges. key = "<event>:<region>".
+    -- Checked before enqueueing a mission task on enter/leave events.
+    CREATE TABLE IF NOT EXISTS nudge_throttle (
+      user_id    TEXT NOT NULL,
+      key        TEXT NOT NULL,
+      last_fired INTEGER NOT NULL,
+      PRIMARY KEY (user_id, key)
+    );
+
     CREATE TABLE IF NOT EXISTS hive_mind (
       id          INTEGER PRIMARY KEY AUTOINCREMENT,
       agent_id    TEXT NOT NULL,
@@ -787,10 +831,10 @@ export function saveMemoryEmbedding(memoryId: number, embedding: number[]): void
   db.prepare('UPDATE memories SET embedding = ? WHERE id = ?').run(JSON.stringify(embedding), memoryId);
 }
 
-export function getMemoriesWithEmbeddings(chatId: string): Array<{ id: number; embedding: number[]; summary: string; importance: number; salience: number; agent_id: string }> {
+export function getMemoriesWithEmbeddings(chatId: string): Array<{ id: number; embedding: number[]; summary: string; importance: number; salience: number; agent_id: string; created_at: number }> {
   const rows = db
-    .prepare('SELECT id, embedding, summary, importance, salience, agent_id FROM memories WHERE chat_id = ? AND embedding IS NOT NULL AND superseded_by IS NULL')
-    .all(chatId) as Array<{ id: number; embedding: string; summary: string; importance: number; salience: number; agent_id: string }>;
+    .prepare('SELECT id, embedding, summary, importance, salience, agent_id, created_at FROM memories WHERE chat_id = ? AND embedding IS NOT NULL AND superseded_by IS NULL')
+    .all(chatId) as Array<{ id: number; embedding: string; summary: string; importance: number; salience: number; agent_id: string; created_at: number }>;
   return rows.map((r) => ({
     id: r.id,
     embedding: JSON.parse(r.embedding) as number[],
@@ -798,6 +842,7 @@ export function getMemoriesWithEmbeddings(chatId: string): Array<{ id: number; e
     importance: r.importance,
     salience: r.salience,
     agent_id: r.agent_id,
+    created_at: r.created_at,
   }));
 }
 
@@ -921,6 +966,37 @@ export function supersedeMemory(oldId: number, newId: number): void {
   db.prepare(
     `UPDATE memories SET superseded_by = ?, importance = importance * 0.3, salience = salience * 0.5 WHERE id = ?`,
   ).run(newId, oldId);
+}
+
+/**
+ * Merge new memory content into an existing row when a semantic duplicate is
+ * found within the freshness window. Keeps the id/chat/agent/raw_text intact
+ * but refreshes the high-value fields (summary, entities, topics, embedding)
+ * and bumps salience so the merged entry rises in retrieval.
+ * Used by memory-ingest when cosine similarity > 0.85 within 30 days of the
+ * existing row — it's the same fact expressed again, not a supersede event.
+ */
+export function mergeMemoryContent(
+  memoryId: number,
+  summary: string,
+  entities: string[],
+  topics: string[],
+  embedding: number[],
+): void {
+  const now = Math.floor(Date.now() / 1000);
+  db.prepare(
+    `UPDATE memories
+     SET summary = ?, entities = ?, topics = ?, embedding = ?, accessed_at = ?,
+         salience = MIN(salience + 0.2, 5.0)
+     WHERE id = ?`,
+  ).run(
+    summary,
+    JSON.stringify(entities),
+    JSON.stringify(topics),
+    JSON.stringify(embedding),
+    now,
+    memoryId,
+  );
 }
 
 export function updateMemoryConnections(memoryId: number, connections: Array<{ linked_to: number; relationship: string }>): void {
@@ -2237,4 +2313,158 @@ export function getRecentBlockedActions(limit = 10): AuditLogEntry[] {
   return db.prepare(
     `SELECT * FROM audit_log WHERE blocked = 1 ORDER BY created_at DESC LIMIT ?`,
   ).all(limit) as AuditLogEntry[];
+}
+
+// ── OwnTracks location awareness ─────────────────────────────────────
+// Webhook ingests OwnTracks payloads (iPhone/Android GPS app) so agents
+// know where Chris is right now. See src/owntracks.ts for the handler.
+
+export interface OwnTracksPayload {
+  _type: string;
+  tst: number;
+  lat?: number;
+  lon?: number;
+  acc?: number;
+  vel?: number;
+  batt?: number;
+  event?: 'enter' | 'leave';
+  desc?: string;
+  inregions?: string[];
+}
+
+export interface CurrentLocationRow {
+  user_id: string;
+  region: string | null;
+  lat: number | null;
+  lon: number | null;
+  tst: number;
+  updated_at: number;
+  last_transition_event: 'enter' | 'leave' | null;
+  last_transition_region: string | null;
+  last_transition_tst: number | null;
+}
+
+function resolveRegion(p: OwnTracksPayload): string | null {
+  if (p._type === 'transition') return p.desc ?? null;
+  if (p.inregions && p.inregions.length > 0) return p.inregions[0];
+  return null;
+}
+
+export function insertLocationEvent(userId: string, p: OwnTracksPayload): void {
+  const now = Math.floor(Date.now() / 1000);
+  db.prepare(
+    `INSERT INTO location_events
+       (user_id, tst, received_at, type, event, region, lat, lon, accuracy, velocity, battery, raw_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    userId,
+    p.tst,
+    now,
+    p._type,
+    p.event ?? null,
+    resolveRegion(p),
+    p.lat ?? null,
+    p.lon ?? null,
+    p.acc ?? null,
+    p.vel ?? null,
+    p.batt ?? null,
+    JSON.stringify(p),
+  );
+}
+
+/**
+ * Upsert current_location with last-tst-wins semantics. Returns true if the
+ * row was actually updated (helps the ingest decide whether to fire a nudge).
+ * On tst ties, a transition event wins over a location event (semantic truth).
+ */
+export function upsertCurrentLocation(userId: string, p: OwnTracksPayload): boolean {
+  const now = Math.floor(Date.now() / 1000);
+  const existing = db
+    .prepare('SELECT tst FROM current_location WHERE user_id = ?')
+    .get(userId) as { tst: number } | undefined;
+
+  if (existing) {
+    const isTransition = p._type === 'transition';
+    const canWrite = p.tst > existing.tst || (p.tst === existing.tst && isTransition);
+    if (!canWrite) return false;
+  }
+
+  const region = resolveRegion(p);
+  const isTransition = p._type === 'transition';
+
+  if (isTransition) {
+    const newRegion = p.event === 'enter' ? (p.desc ?? null) : null;
+    db.prepare(
+      `INSERT INTO current_location
+         (user_id, region, lat, lon, tst, updated_at,
+          last_transition_event, last_transition_region, last_transition_tst)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(user_id) DO UPDATE SET
+         region = excluded.region,
+         lat = excluded.lat,
+         lon = excluded.lon,
+         tst = excluded.tst,
+         updated_at = excluded.updated_at,
+         last_transition_event = excluded.last_transition_event,
+         last_transition_region = excluded.last_transition_region,
+         last_transition_tst = excluded.last_transition_tst`,
+    ).run(
+      userId,
+      newRegion,
+      p.lat ?? null,
+      p.lon ?? null,
+      p.tst,
+      now,
+      p.event ?? null,
+      p.desc ?? null,
+      p.tst,
+    );
+  } else {
+    db.prepare(
+      `INSERT INTO current_location
+         (user_id, region, lat, lon, tst, updated_at,
+          last_transition_event, last_transition_region, last_transition_tst)
+       VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
+       ON CONFLICT(user_id) DO UPDATE SET
+         region = excluded.region,
+         lat = excluded.lat,
+         lon = excluded.lon,
+         tst = excluded.tst,
+         updated_at = excluded.updated_at`,
+    ).run(userId, region, p.lat ?? null, p.lon ?? null, p.tst, now);
+  }
+  return true;
+}
+
+export function getCurrentLocation(userId = 'chris'): CurrentLocationRow | null {
+  const row = db
+    .prepare('SELECT * FROM current_location WHERE user_id = ?')
+    .get(userId) as CurrentLocationRow | undefined;
+  return row ?? null;
+}
+
+export function pruneLocationEvents(days: number): number {
+  const cutoff = Math.floor(Date.now() / 1000) - days * 86400;
+  // Only prune raw location pings. Transition events are semantic and kept forever.
+  const result = db
+    .prepare(`DELETE FROM location_events WHERE type = 'location' AND received_at < ?`)
+    .run(cutoff);
+  return result.changes;
+}
+
+export function wasNudgedRecently(userId: string, key: string, windowSec: number): boolean {
+  const row = db
+    .prepare('SELECT last_fired FROM nudge_throttle WHERE user_id = ? AND key = ?')
+    .get(userId, key) as { last_fired: number } | undefined;
+  if (!row) return false;
+  return Math.floor(Date.now() / 1000) - row.last_fired < windowSec;
+}
+
+export function markNudged(userId: string, key: string): void {
+  const now = Math.floor(Date.now() / 1000);
+  db.prepare(
+    `INSERT INTO nudge_throttle (user_id, key, last_fired)
+     VALUES (?, ?, ?)
+     ON CONFLICT(user_id, key) DO UPDATE SET last_fired = excluded.last_fired`,
+  ).run(userId, key, now);
 }

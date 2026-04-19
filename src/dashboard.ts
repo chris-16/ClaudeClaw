@@ -5,7 +5,7 @@ import { serve } from '@hono/node-server';
 
 import fs from 'fs';
 import path from 'path';
-import { AGENT_ID, ALLOWED_CHAT_ID, DASHBOARD_PORT, DASHBOARD_TOKEN, PROJECT_ROOT, STORE_DIR, WHATSAPP_ENABLED, SLACK_USER_TOKEN, CONTEXT_LIMIT, agentDefaultModel } from './config.js';
+import { AGENT_ID, ALLOWED_CHAT_ID, DASHBOARD_PORT, DASHBOARD_TOKEN, OWNTRACKS_TOKEN, PROJECT_ROOT, STORE_DIR, WHATSAPP_ENABLED, SLACK_USER_TOKEN, CONTEXT_LIMIT, agentDefaultModel } from './config.js';
 import crypto from 'crypto';
 import {
   getAllScheduledTasks,
@@ -43,6 +43,9 @@ import {
   getCostByAgent,
   getDailyCostAll,
   getMonthlyCostAll,
+  getRetrievalStats,
+  turnsSinceWorkingMemoryUpdate,
+  getWorkingMemory,
 } from './db.js';
 import { generateContent, parseJsonResponse } from './gemini.js';
 import { getSecurityStatus } from './security.js';
@@ -122,6 +125,26 @@ export function startDashboard(botApi?: Api<RawApi>): void {
   // ── Glasses & OpenAI-compat routes (Bearer auth, mounted before dashboard token auth) ──
   app.route('/api/glasses', glassesRoutes);
   app.route('/v1', compatRoutes);
+
+  // ── OwnTracks webhook (dedicated token, mounted before dashboard token auth) ──
+  // Phone app POSTs GPS payloads here. Auth via ?token= query param using
+  // OWNTRACKS_TOKEN (separate from DASHBOARD_TOKEN so rotation is independent).
+  // Returns `[]` because OwnTracks parses the response as an array (reserved
+  // for CMD/friends delivery); anything else logs an app-side warning.
+  app.post('/webhooks/owntracks', async (c) => {
+    if (!OWNTRACKS_TOKEN || c.req.query('token') !== OWNTRACKS_TOKEN) {
+      return c.json([], 401);
+    }
+    try {
+      const { ingestOwnTracksPayload } = await import('./owntracks.js');
+      const body = await c.req.json<unknown>();
+      const events = (Array.isArray(body) ? body : [body]) as import('./db.js').OwnTracksPayload[];
+      await ingestOwnTracksPayload('chris', events);
+    } catch (err) {
+      logger.error({ err: (err as Error).message }, 'OwnTracks ingest failed');
+    }
+    return c.json([]);
+  });
 
   // Token auth middleware (skip glasses/compat routes — they use Bearer auth)
   app.use('*', async (c, next) => {
@@ -283,6 +306,49 @@ export function startDashboard(botApi?: Api<RawApi>): void {
     const timeline = getDashboardMemoryTimeline(chatId, 30);
     const consolidations = getDashboardConsolidations(chatId, 5);
     return c.json({ stats, fading, topAccessed, timeline, consolidations });
+  });
+
+  // Memory health: retrieval metrics, WM freshness per agent, top KG entities.
+  // Surfaces the retrieval_metrics + working_memory + kg_entities signals so
+  // we can see "is the memory system healthy" at a glance without sqlite3.
+  app.get('/api/memory-stats', async (c) => {
+    const chatId = c.req.query('chatId') || ALLOWED_CHAT_ID || '';
+    const hoursBack = parseInt(c.req.query('hours') || '24', 10);
+    const retrieval = getRetrievalStats(Math.max(1, Math.min(hoursBack, 168)));
+
+    // Per-agent WM freshness: turns since last refresh. Infinity means no row yet.
+    const agents = ['main', ...listAgentIds()];
+    const workingMemory = agents.map((agentId) => {
+      const turns = turnsSinceWorkingMemoryUpdate(chatId, agentId);
+      const summary = getWorkingMemory(chatId, agentId);
+      return {
+        agentId,
+        turnsSinceUpdate: turns,
+        summaryPreview: summary ? summary.slice(0, 120) : null,
+        stale: !summary,
+      };
+    });
+
+    // Top KG entities: dynamic import so we don't pull knowledge-graph at
+    // dashboard boot time if the DB happens to be empty.
+    const { getInsights } = await import('./knowledge-graph.js');
+    let topEntities: Array<{ name: string; entityType: string; importance: number }> = [];
+    let kgCounts = { entities: 0, relations: 0, observations: 0 };
+    try {
+      const insights = getInsights(chatId);
+      topEntities = insights.topEntities.slice(0, 5).map((e) => ({
+        name: e.name,
+        entityType: e.entityType,
+        importance: e.importance,
+      }));
+      kgCounts = {
+        entities: insights.entityCount,
+        relations: insights.relationCount,
+        observations: insights.observationCount,
+      };
+    } catch { /* knowledge graph not initialized or empty */ }
+
+    return c.json({ retrieval, workingMemory, topEntities, kgCounts });
   });
 
   // Memory list (for drill-down drawer)

@@ -430,6 +430,35 @@ export function getDashboardHtml(token: string, chatId: string): string {
   </div>
 </div>
 
+<!-- Memory Health (retrieval metrics + working memory + KG) -->
+<h2 class="text-sm font-semibold text-gray-400 uppercase tracking-wider mt-5 mb-2">Memory Health</h2>
+<div class="grid grid-cols-2 gap-2">
+  <div class="card">
+    <div class="text-xs text-gray-400 mb-2">Retrieval latency (24h)<span class="info-tip"><span class="info-icon">\u24D8</span><span class="info-tooltip">Latency of buildMemoryContext per turn. p95 should be under ~200ms if the cache and FTS5 paths are doing their job.</span></span></div>
+    <div class="grid grid-cols-2 gap-1 text-center">
+      <div><div class="stat-val text-base" id="mh-avg">-</div><div class="stat-label">avg ms</div></div>
+      <div><div class="stat-val text-base" id="mh-p95">-</div><div class="stat-label">p95 ms</div></div>
+    </div>
+    <div class="grid grid-cols-2 gap-1 text-center mt-2">
+      <div><div class="stat-val text-base" id="mh-total">-</div><div class="stat-label">queries</div></div>
+      <div><div class="stat-val text-base" id="mh-fts-pct">-</div><div class="stat-label">FTS only</div></div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="text-xs text-gray-400 mb-2">Working memory freshness<span class="info-tip"><span class="info-icon">\u24D8</span><span class="info-tooltip">Turns since each agent's session summary was last refreshed. The bot updates it every 5 turns since the last WM write.</span></span></div>
+    <div id="mh-wm-list" class="text-xs space-y-1"></div>
+  </div>
+  <div class="card col-span-2">
+    <div class="text-xs text-gray-400 mb-2">Knowledge graph<span class="info-tip"><span class="info-icon">\u24D8</span><span class="info-tooltip">Entity / observation / relation counts plus the top entities by importance.</span></span></div>
+    <div class="grid grid-cols-3 gap-1 text-center mb-2">
+      <div><div class="stat-val text-base" id="mh-kg-ent">-</div><div class="stat-label">entities</div></div>
+      <div><div class="stat-val text-base" id="mh-kg-obs">-</div><div class="stat-label">observations</div></div>
+      <div><div class="stat-val text-base" id="mh-kg-rel">-</div><div class="stat-label">relations</div></div>
+    </div>
+    <div id="mh-kg-top" class="text-xs"></div>
+  </div>
+</div>
+
 </div><!-- end LEFT COLUMN -->
 
 <!-- RIGHT COLUMN -->
@@ -1955,10 +1984,48 @@ function closeTaskHistory() {
 // Poll mission tasks more frequently (every 15s) for responsiveness
 setInterval(loadMissionControl, 15000);
 
+async function loadMemoryHealth() {
+  try {
+    const data = await api('/api/memory-stats');
+    const r = data.retrieval || {};
+    const setText = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+    setText('mh-avg', r.avgLatencyMs ?? '-');
+    setText('mh-p95', r.p95LatencyMs ?? '-');
+    setText('mh-total', r.total ?? 0);
+    const ftsPct = r.total > 0 ? Math.round((r.skippedEmbedding / r.total) * 100) : 0;
+    setText('mh-fts-pct', r.total > 0 ? ftsPct + '%' : '-');
+
+    const wmList = document.getElementById('mh-wm-list');
+    if (wmList) {
+      wmList.innerHTML = (data.workingMemory || []).map((w) => {
+        const tone = w.stale ? 'text-gray-500' : (w.turnsSinceUpdate > 5 ? 'text-yellow-500' : 'text-green-500');
+        const status = w.stale ? 'no summary yet' : (w.turnsSinceUpdate + ' turns since update');
+        return '<div class="flex justify-between"><span class="' + tone + '">' + w.agentId + '</span><span class="text-gray-400">' + status + '</span></div>';
+      }).join('');
+    }
+
+    const kg = data.kgCounts || {};
+    setText('mh-kg-ent', kg.entities ?? 0);
+    setText('mh-kg-obs', kg.observations ?? 0);
+    setText('mh-kg-rel', kg.relations ?? 0);
+
+    const topEl = document.getElementById('mh-kg-top');
+    if (topEl) {
+      const entities = data.topEntities || [];
+      if (entities.length === 0) {
+        topEl.innerHTML = '<div class="text-gray-500">no entities yet</div>';
+      } else {
+        topEl.innerHTML = '<div class="text-gray-400 mb-1">Top 5 by importance:</div>' +
+          entities.map((e) => '<div class="flex justify-between"><span>' + e.name + ' <span class="text-gray-500">(' + e.entityType + ')</span></span><span class="text-gray-400">' + e.importance.toFixed(2) + '</span></div>').join('');
+      }
+    }
+  } catch (err) { /* non-fatal */ }
+}
+
 async function refreshAll() {
   const btn = document.getElementById('refresh-btn').querySelector('svg');
   btn.classList.add('refresh-spin');
-  await Promise.all([loadInfo(), loadTasks(), loadMemories(), loadHealth(), loadTokens(), loadAgents(), loadHiveMind(), loadSummary(), loadMissionControl(), loadRateTracker(7)]);
+  await Promise.all([loadInfo(), loadTasks(), loadMemories(), loadHealth(), loadTokens(), loadAgents(), loadHiveMind(), loadSummary(), loadMissionControl(), loadRateTracker(7), loadMemoryHealth()]);
   btn.classList.remove('refresh-spin');
   document.getElementById('last-updated').textContent = new Date().toLocaleTimeString();
 }

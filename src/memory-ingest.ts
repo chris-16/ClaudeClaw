@@ -1,8 +1,20 @@
 import { generateContent, parseJsonResponse } from './gemini.js';
 import { cosineSimilarity, embedText } from './embeddings.js';
-import { getMemoriesWithEmbeddings, saveStructuredMemory, saveMemoryEmbedding } from './db.js';
+import {
+  getMemoriesWithEmbeddings,
+  mergeMemoryContent,
+  saveStructuredMemory,
+  saveMemoryEmbedding,
+  supersedeMemory,
+} from './db.js';
 import { createEntity, invalidateKnowledgeCache } from './knowledge-graph.js';
 import { logger } from './logger.js';
+
+// Memories with cosine similarity above this are "the same fact". Within the
+// freshness window, we merge the new content into the old row. Outside it,
+// we keep both rows and mark the older as superseded_by the new one.
+const DUP_SIM_THRESHOLD = 0.85;
+const MERGE_WINDOW_SECONDS = 30 * 24 * 60 * 60;
 
 // Callback for notifying when a high-importance memory is created.
 // Set by bot.ts to send a Telegram notification.
@@ -112,18 +124,45 @@ export async function ingestConversationTurn(
       logger.warn({ err: embErr }, 'Failed to generate embedding for duplicate check');
     }
 
-    // Duplicate detection: skip if a very similar memory already exists
+    // Duplicate detection: merge (within 30 days) or supersede (older) instead
+    // of silently dropping. Keeps memory content fresh when the same fact is
+    // mentioned again — the prior "skip" behavior lost later corrections.
     if (embedding.length > 0) {
+      const now = Math.floor(Date.now() / 1000);
       const existing = getMemoriesWithEmbeddings(chatId);
       for (const mem of existing) {
         const sim = cosineSimilarity(embedding, mem.embedding);
-        if (sim > 0.85) {
-          logger.debug(
-            { similarity: sim.toFixed(3), existingId: mem.id, newSummary: result.summary.slice(0, 60) },
-            'Skipping duplicate memory',
+        if (sim <= DUP_SIM_THRESHOLD) continue;
+
+        const age = now - mem.created_at;
+        if (age <= MERGE_WINDOW_SECONDS) {
+          // Recent duplicate: merge the new content in-place, bump salience.
+          mergeMemoryContent(mem.id, result.summary, result.entities ?? [], result.topics ?? [], embedding);
+          logger.info(
+            { similarity: sim.toFixed(3), mergedInto: mem.id, summary: result.summary.slice(0, 60) },
+            'Memory merged into existing duplicate',
           );
           return false;
         }
+
+        // Older duplicate: keep both; create the new memory and mark the old as superseded.
+        const newId = saveStructuredMemory(
+          chatId,
+          userMessage,
+          result.summary,
+          result.entities ?? [],
+          result.topics ?? [],
+          importance,
+          'conversation',
+          agentId,
+        );
+        saveMemoryEmbedding(newId, embedding);
+        supersedeMemory(mem.id, newId);
+        logger.info(
+          { similarity: sim.toFixed(3), staleId: mem.id, newId, ageDays: Math.round(age / 86400) },
+          'Memory superseded older duplicate',
+        );
+        return true;
       }
     }
 
