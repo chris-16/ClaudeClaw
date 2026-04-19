@@ -143,13 +143,15 @@ export async function buildMemoryContext(
   // Layer 6: Knowledge Graph semantic retrieval.
   // Reuses the cached query embedding, applies agent-id boost so the caller's
   // own knowledge ranks higher without hiding cross-agent observations.
+  // Kept compact (3 hits, 180 chars each) so long resumed sessions don't
+  // accumulate enough per-turn bytes to blow past the model context window.
   const kgLines: string[] = [];
   if (queryEmbedding && queryEmbedding.length > 0) {
     try {
-      const kgHits = searchKnowledgeSemantic(chatId, queryEmbedding, 5, agentId);
+      const kgHits = searchKnowledgeSemantic(chatId, queryEmbedding, 3, agentId);
       for (const h of kgHits) {
-        const own = h.agentId === agentId ? '' : ` (from ${h.agentId})`;
-        kgLines.push(`- [KG] ${h.entityName}${own}: ${h.content.slice(0, 300)}`);
+        const own = h.agentId === agentId ? '' : ` (${h.agentId})`;
+        kgLines.push(`- ${h.entityName}${own}: ${h.content.slice(0, 180)}`);
       }
     } catch (err) {
       logger.debug({ err }, 'Knowledge graph retrieval skipped');
