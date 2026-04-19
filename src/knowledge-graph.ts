@@ -538,19 +538,28 @@ interface KGCacheEntry {
 
 const kgCache = new Map<string, KGCacheEntry>();
 const KG_CACHE_TTL_MS = 5 * 60 * 1000;
+// Each parsed embedding is a 768-float array (~6KB after JS overhead).
+// 2000 rows × 6KB ≈ 12MB per agent process. With 5 agent processes on a
+// 15GB VPS that's ~60MB total — safe even when Claude Code subprocesses
+// balloon concurrently. Lower-salience entries are reachable via the MCP
+// search_nodes tool when the agent explicitly needs deep recall.
+const KG_CACHE_MAX_ROWS = parseInt(process.env.KG_CACHE_MAX_ROWS || '2000', 10);
 
 function getKGCache(chatId: string): KGCacheEntry {
   const d = getDb();
   const sig = d.prepare(
     'SELECT COUNT(*) AS c, COALESCE(MAX(o.id), 0) AS m FROM kg_observations o JOIN kg_entities e ON o.entity_id = e.id WHERE e.chat_id = ?'
   ).get(chatId) as { c: number; m: number };
-  const rowSig = `${sig.c}:${sig.m}`;
+  const rowSig = `${sig.c}:${sig.m}:${KG_CACHE_MAX_ROWS}`;
 
   const cached = kgCache.get(chatId);
   if (cached && cached.rowSig === rowSig && Date.now() - cached.builtAt < KG_CACHE_TTL_MS) {
     return cached;
   }
 
+  // Load only the highest-value observations: rank by entity salience × importance,
+  // then by observation recency. Cold misses for low-priority entities fall back
+  // to the MCP search_nodes tool, which reads directly from disk.
   const rows = d.prepare(`
     SELECT
       o.content,
@@ -566,7 +575,9 @@ function getKGCache(chatId: string): KGCacheEntry {
     FROM kg_observations o
     JOIN kg_entities e ON o.entity_id = e.id
     WHERE e.chat_id = ?
-  `).all(chatId) as Array<{
+    ORDER BY (e.salience * e.importance) DESC, o.created_at DESC
+    LIMIT ?
+  `).all(chatId, KG_CACHE_MAX_ROWS) as Array<{
     content: string;
     obs_embedding: string | null;
     obs_agent: string;

@@ -33,8 +33,9 @@ async function run() {
       lastCtx = ctx.contextText;
     }
 
-    const hasKg = lastCtx.includes('[Knowledge graph]');
-    const kgLineCount = (lastCtx.match(/- \[KG\]/g) || []).length;
+    const kgBlock = lastCtx.split('[Knowledge graph]')[1]?.split('[End knowledge graph]')[0] ?? '';
+    const hasKg = kgBlock.length > 0;
+    const kgLineCount = (kgBlock.match(/^- /gm) || []).length;
     const memLineCount = (lastCtx.match(/^- \[\d\.\d\]/gm) || []).length;
 
     console.log(`Q: "${q}"`);
