@@ -265,6 +265,23 @@ function createSchema(database: Database.Database): void {
       PRIMARY KEY (user_id, key)
     );
 
+    -- Known places for location matching. When a location ping arrives,
+    -- check if it's within radius of any place and update current_location.region.
+    CREATE TABLE IF NOT EXISTS places (
+      id          TEXT PRIMARY KEY,
+      name        TEXT NOT NULL,
+      lat         REAL NOT NULL,
+      lon         REAL NOT NULL,
+      radius      INTEGER NOT NULL DEFAULT 100,
+      type        TEXT,
+      city        TEXT,
+      country     TEXT,
+      metadata    TEXT,
+      created_at  INTEGER NOT NULL,
+      updated_at  INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_places_lat_lon ON places(lat, lon);
+
     CREATE TABLE IF NOT EXISTS hive_mind (
       id          INTEGER PRIMARY KEY AUTOINCREMENT,
       agent_id    TEXT NOT NULL,
@@ -2347,6 +2364,13 @@ export interface CurrentLocationRow {
 function resolveRegion(p: OwnTracksPayload): string | null {
   if (p._type === 'transition') return p.desc ?? null;
   if (p.inregions && p.inregions.length > 0) return p.inregions[0];
+
+  // Fall back to place matching if we have coordinates
+  if (typeof p.lat === 'number' && typeof p.lon === 'number') {
+    const place = findPlaceByCoordinates(p.lat, p.lon);
+    if (place) return place.name;
+  }
+
   return null;
 }
 
@@ -2467,4 +2491,116 @@ export function markNudged(userId: string, key: string): void {
      VALUES (?, ?, ?)
      ON CONFLICT(user_id, key) DO UPDATE SET last_fired = excluded.last_fired`,
   ).run(userId, key, now);
+}
+// ─────────────────────────────────────────────────────────────────────────────
+// Places (known locations for semantic location tracking)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface Place {
+  id: string;
+  name: string;
+  lat: number;
+  lon: number;
+  radius: number;
+  type?: string;
+  city?: string;
+  country?: string;
+  metadata?: string;
+  created_at: number;
+  updated_at: number;
+}
+
+/**
+ * Calculate distance between two coordinates using Haversine formula (in meters)
+ */
+function haversineDistance(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  const R = 6371000; // Earth radius in meters
+  const φ1 = (lat1 * Math.PI) / 180;
+  const φ2 = (lat2 * Math.PI) / 180;
+  const Δφ = ((lat2 - lat1) * Math.PI) / 180;
+  const Δλ = ((lon2 - lon1) * Math.PI) / 180;
+
+  const a =
+    Math.sin(Δφ / 2) * Math.sin(Δφ / 2) +
+    Math.cos(φ1) * Math.cos(φ2) * Math.sin(Δλ / 2) * Math.sin(Δλ / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+
+  return R * c;
+}
+
+/**
+ * Add or update a place
+ */
+export function upsertPlace(place: Omit<Place, 'created_at' | 'updated_at'>): void {
+  const now = Math.floor(Date.now() / 1000);
+  db.prepare(
+    `INSERT INTO places (id, name, lat, lon, radius, type, city, country, metadata, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       name = excluded.name,
+       lat = excluded.lat,
+       lon = excluded.lon,
+       radius = excluded.radius,
+       type = excluded.type,
+       city = excluded.city,
+       country = excluded.country,
+       metadata = excluded.metadata,
+       updated_at = excluded.updated_at`,
+  ).run(
+    place.id,
+    place.name,
+    place.lat,
+    place.lon,
+    place.radius,
+    place.type ?? null,
+    place.city ?? null,
+    place.country ?? null,
+    place.metadata ?? null,
+    now,
+    now,
+  );
+}
+
+/**
+ * Get all places
+ */
+export function getPlaces(): Place[] {
+  return db.prepare('SELECT * FROM places ORDER BY name').all() as Place[];
+}
+
+/**
+ * Get a specific place by ID
+ */
+export function getPlace(id: string): Place | null {
+  const row = db.prepare('SELECT * FROM places WHERE id = ?').get(id) as Place | undefined;
+  return row ?? null;
+}
+
+/**
+ * Find a place that contains the given coordinates (within its radius)
+ * Returns the closest match if multiple places overlap
+ */
+export function findPlaceByCoordinates(lat: number, lon: number): Place | null {
+  const places = db.prepare('SELECT * FROM places').all() as Place[];
+
+  let closest: Place | null = null;
+  let minDistance = Infinity;
+
+  for (const place of places) {
+    const distance = haversineDistance(lat, lon, place.lat, place.lon);
+    if (distance <= place.radius && distance < minDistance) {
+      closest = place;
+      minDistance = distance;
+    }
+  }
+
+  return closest;
+}
+
+/**
+ * Delete a place
+ */
+export function deletePlace(id: string): boolean {
+  const result = db.prepare('DELETE FROM places WHERE id = ?').run(id);
+  return result.changes > 0;
 }
