@@ -465,9 +465,17 @@ export async function searchNodesSemantic(
   }
   if (queryEmbedding.length === 0) return searchNodes(chatId, query, limit);
 
+  // Cap the candidate set so a cold MCP invocation never loads ~9k embeddings.
+  // Ordering by salience × importance keeps the most useful entries and bounds
+  // the memory spike (~12MB at 2000 rows vs ~120MB at 9000).
+  const MAX_CANDIDATES = parseInt(process.env.KG_CACHE_MAX_ROWS || '2000', 10);
+
   const entities = d.prepare(
-    'SELECT id, name, entity_type, importance, embedding FROM kg_entities WHERE chat_id = ? AND embedding IS NOT NULL'
-  ).all(chatId) as Array<Pick<KGEntity, 'id' | 'name' | 'entity_type' | 'importance' | 'embedding'>>;
+    `SELECT id, name, entity_type, importance, salience, embedding FROM kg_entities
+     WHERE chat_id = ? AND embedding IS NOT NULL
+     ORDER BY (salience * importance) DESC
+     LIMIT ?`
+  ).all(chatId, MAX_CANDIDATES) as Array<Pick<KGEntity, 'id' | 'name' | 'entity_type' | 'importance' | 'salience' | 'embedding'>>;
 
   const scored: Array<{ id: number; score: number }> = [];
   for (const e of entities) {
@@ -481,7 +489,9 @@ export async function searchNodesSemantic(
     SELECT o.entity_id, o.embedding FROM kg_observations o
     JOIN kg_entities e ON o.entity_id = e.id
     WHERE e.chat_id = ? AND o.embedding IS NOT NULL
-  `).all(chatId) as Array<{ entity_id: number; embedding: string }>;
+    ORDER BY (e.salience * e.importance) DESC, o.created_at DESC
+    LIMIT ?
+  `).all(chatId, MAX_CANDIDATES) as Array<{ entity_id: number; embedding: string }>;
 
   for (const o of obsRows) {
     const emb = JSON.parse(o.embedding) as number[];
@@ -498,11 +508,21 @@ export async function searchNodesSemantic(
   if (topIds.length === 0) return searchNodes(chatId, query, limit);
 
   const results: EntityWithObservations[] = [];
+  // Batch-update accessed_at + salience in a single write instead of N round-trips.
+  // Previously N touchEntity calls contended with live bot writes and could stall.
+  const now = Math.floor(Date.now() / 1000);
+  const placeholders = topIds.map(() => '?').join(',');
+  try {
+    d.prepare(
+      `UPDATE kg_entities SET accessed_at = ?, salience = MIN(salience + 0.1, 5.0)
+       WHERE id IN (${placeholders})`
+    ).run(now, ...topIds);
+  } catch { /* touch is advisory; don't fail the read */ }
+
   for (const id of topIds) {
     const entity = d.prepare('SELECT * FROM kg_entities WHERE id = ?').get(id) as KGEntity | undefined;
     if (!entity) continue;
-    touchEntity(entity.id);
-    const obs = d.prepare('SELECT content FROM kg_observations WHERE entity_id = ? ORDER BY created_at DESC').all(entity.id) as Array<{ content: string }>;
+    const obs = d.prepare('SELECT content FROM kg_observations WHERE entity_id = ? ORDER BY created_at DESC LIMIT 10').all(entity.id) as Array<{ content: string }>;
     results.push({
       name: entity.name,
       entityType: entity.entity_type,
