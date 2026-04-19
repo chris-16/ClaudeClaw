@@ -35,22 +35,22 @@ describe('ingestConversationTurn', () => {
 
   // ── Hard filters (skip before hitting Gemini) ────────────────────
 
-  it('skips messages <= 15 characters', async () => {
+  it('skips messages <= 40 characters', async () => {
     const result = await ingestConversationTurn('chat1', 'short msg', 'ok');
     expect(result).toBe(false);
     expect(mockGenerateContent).not.toHaveBeenCalled();
   });
 
-  it('skips messages exactly 15 characters', async () => {
-    const result = await ingestConversationTurn('chat1', '123456789012345', 'ok');
+  it('skips messages exactly 40 characters', async () => {
+    const result = await ingestConversationTurn('chat1', 'a'.repeat(40), 'ok');
     expect(result).toBe(false);
     expect(mockGenerateContent).not.toHaveBeenCalled();
   });
 
-  it('processes messages of 16 characters', async () => {
+  it('processes messages of 41 characters', async () => {
     mockGenerateContent.mockResolvedValue('{}');
     mockParseJson.mockReturnValue({ skip: true });
-    const result = await ingestConversationTurn('chat1', '1234567890123456', 'ok');
+    const result = await ingestConversationTurn('chat1', 'a'.repeat(41), 'ok');
     // Should have called Gemini even though it was skipped by LLM
     expect(mockGenerateContent).toHaveBeenCalled();
     expect(result).toBe(false);
@@ -173,7 +173,7 @@ describe('ingestConversationTurn', () => {
     mockGenerateContent.mockResolvedValue(JSON.stringify(extraction));
     mockParseJson.mockReturnValue(extraction);
 
-    const result = await ingestConversationTurn('chat1', 'some useful message longer than fifteen', 'ok');
+    const result = await ingestConversationTurn('chat1', 'some genuinely useful message that exceeds the length filter', 'ok');
     expect(result).toBe(true);
     expect(mockSave).toHaveBeenCalled();
   });
@@ -191,7 +191,7 @@ describe('ingestConversationTurn', () => {
     mockGenerateContent.mockResolvedValue(JSON.stringify(extraction));
     mockParseJson.mockReturnValue(extraction);
 
-    await ingestConversationTurn('chat1', 'extremely important message for testing', 'noted');
+    await ingestConversationTurn('chat1', 'extremely important message that survives the length filter', 'noted');
     expect(mockSave).toHaveBeenCalledWith(
       'chat1',
       expect.any(String),
