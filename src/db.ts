@@ -1736,6 +1736,26 @@ export function getWorkingMemory(chatId: string, agentId: string, maxAgeMs = 24 
   return row.summary || null;
 }
 
+/**
+ * Count user turns logged for this (chat, agent) since the last working-memory
+ * update. Independent of memory extraction — the prior trigger reset whenever
+ * a memory was saved, which meant high-yield conversations (director, dratlas)
+ * never reached the 5-turn threshold and their working memory went stale.
+ */
+export function turnsSinceWorkingMemoryUpdate(chatId: string, agentId: string): number {
+  const wm = db
+    .prepare('SELECT updated_at FROM working_memory WHERE chat_id = ? AND agent_id = ?')
+    .get(chatId, agentId) as { updated_at: number } | undefined;
+  const since = wm?.updated_at ?? 0;
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS cnt FROM conversation_log
+       WHERE chat_id = ? AND agent_id = ? AND role = 'user' AND created_at > ?`,
+    )
+    .get(chatId, agentId, since) as { cnt: number };
+  return row.cnt;
+}
+
 export function saveWorkingMemorySummary(chatId: string, agentId: string, summary: string): void {
   const now = Math.floor(Date.now() / 1000);
   db

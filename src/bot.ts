@@ -23,7 +23,7 @@ import {
   MONTHLY_BUDGET_USD,
   SMART_ROUTING,
 } from './config.js';
-import { clearSession, getRecentConversation, getRecentMemories, getRecentTaskOutputs, getSession, getSessionConversation, logToHiveMind, pinMemory, unpinMemory, setSession, lookupWaChatId, saveWaMessageMap, saveTokenUsage, getDailyCostAll, getMonthlyCostAll, turnsSinceLastMemory } from './db.js';
+import { clearSession, getRecentConversation, getRecentMemories, getRecentTaskOutputs, getSession, getSessionConversation, logToHiveMind, pinMemory, unpinMemory, setSession, lookupWaChatId, saveWaMessageMap, saveTokenUsage, getDailyCostAll, getMonthlyCostAll, turnsSinceLastMemory, turnsSinceWorkingMemoryUpdate } from './db.js';
 import { logger } from './logger.js';
 import { downloadMedia, buildPhotoMessage, buildDocumentMessage, buildVideoMessage } from './media.js';
 import { buildMemoryContext, evaluateMemoryRelevance, saveConversationTurn, updateWorkingMemory } from './memory.js';
@@ -664,10 +664,10 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
       if (surfacedMemoryIds.length > 0) {
         void evaluateMemoryRelevance(surfacedMemoryIds, surfacedMemorySummaries, message, rawResponse).catch(() => {});
       }
-      // Fire-and-forget: refresh working memory every 5 turns so the session
-      // summary stays current without gemini-churn on every turn.
-      const turnsNow = turnsSinceLastMemory(chatIdStr, AGENT_ID);
-      if (turnsNow > 0 && turnsNow % 5 === 0) {
+      // Fire-and-forget: refresh working memory every 5 user turns since the
+      // last update. Counts turns independently of memory extraction so
+      // high-yield conversations still refresh their session summary.
+      if (turnsSinceWorkingMemoryUpdate(chatIdStr, AGENT_ID) >= 5) {
         void updateWorkingMemory(chatIdStr, AGENT_ID).catch(() => {});
       }
     }
